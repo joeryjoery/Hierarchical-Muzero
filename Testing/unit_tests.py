@@ -163,7 +163,7 @@ class TestHexMuZero(unittest.TestCase):
         super().__init__(*args, **kwargs)
         # Setup required for unit tests.
         print("Unit testing CWD:", os.getcwd())
-        self.config = DotDict.from_json("../Configurations/ModelConfigs/MuzeroBoard.json")
+        self.config = DotDict.from_json("../Configurations/ModelConfigs/legacy/MuzeroBoard.json")
         self.g = HexGame(self.hex_board_size)
         self.net = HexNet(self.g, self.config.net_args)
         self.mcts = MuZeroMCTS(self.g, self.net, self.config.args)
@@ -360,7 +360,7 @@ class TestTreeSearch(unittest.TestCase):
         super().__init__(*args, **kwargs)
         # Setup required for unit tests.
         print("Unit testing CWD:", os.getcwd())
-        self.config = DotDict.from_json("../Configurations/ModelConfigs/MuzeroCartpole.json")
+        self.config = DotDict.from_json("../Configurations/ModelConfigs/legacy/MuzeroCartpole.json")
         self.g = GymGame('CartPole-v1')
         self.net = GymNet(self.g, self.config.net_args)
         self.mcts = MuZeroMCTS(self.g, self.net, self.config.args)
