@@ -11,11 +11,12 @@ import os
 from abc import ABC, abstractmethod
 
 import tensorflow as tf
+import tensorflow_probability as tfp
 import numpy as np
 
 from utils import DotDict
 from utils.loss_utils import scalar_loss, scale_gradient, safe_l2norm
-from utils.debugging import MuZeroMonitor
+from utils.debugging import MuZeroMonitor, ContinuousMuZeroMonitor
 
 
 class MuZeroNeuralNet(ABC):
@@ -250,3 +251,126 @@ class MuZeroNeuralNet(ABC):
         if hasattr(self.neural_net, 'decoder'):
             decoder_path = os.path.join(folder, 'decoder_' + filename)
             self.neural_net.decoder.load_weights(decoder_path)
+
+
+class MuZeroContinuousNeuralNet(MuZeroNeuralNet, ABC):
+
+    def __init__(self, game, net_args: DotDict, builder: typing.Callable, epsilon: float = 1e-4) -> None:
+        super().__init__(game, net_args, builder)
+
+        # Override parent Monitor object.
+        self.monitor = ContinuousMuZeroMonitor(self)
+
+        self.distribution = tfp.distributions.Beta
+        self.epsilon = epsilon
+
+    @tf.function
+    def loss_function(self, observations, actions, target_vs, target_rs, target_params,
+                      target_observations, action_supports, sample_weights) -> typing.Tuple[tf.Tensor, typing.List]:
+        """
+        TODO: Rework doc.
+        Defines the computation graph for computing the loss of a MuZero model given data.
+
+        The function recurrently unrolls the MuZero neural network based on data trajectories.
+        From the collected output tensors, this function aggregates the loss for each prediction head for
+        each unrolled time step k = 0, 1, ..., K.
+
+        We expect target_pis/ MCTS probability vectors extrapolated beyond terminal states (i.e., no valid search
+        statistics) to be a zero-vector. This is important as we infer the unrolling beyond terminal states by
+        summing the MCTS probability vectors assuming that they should define proper distributions.
+
+        For unrolled states beyond terminal environment states, we cancel the gradient for the probability vector.
+        We keep gradients for the value and reward prediction, so that they learn to recognize terminal states
+        during MCTS search. Note that the root state could be provided as a terminal state, this would mean that
+        the probability vector head would receive zero gradient for the entire unrolling.
+
+        If specified, the dynamics function will receive a slight differentiable penalty based on the
+        target_observations and the predicted latent state by the encoder network.
+
+        :param observations: tf.Tensor in R^(batch_size x width x height x (depth * time)). Stacked state observations.
+        :param actions: tf.Tensor in {0, 1}^(batch_size x K x |action_space|). One-hot encoded actions for unrolling.
+        :param target_vs: tf.Tensor either in [0,1] or R with dimensions (K x batch_size x support_size)
+        :param target_rs: tf.Tensor either in [0,1] or R with dimensions (K x batch_size x support_size)
+        :param target_params: tf.Tensor Log density of actions by Progressive Widening
+                                        (K x batch_size x |action_batch| x |action_space|)
+        :param target_observations: tf.Tensor of same dimensions of observations for each unroll step in axis 1.
+        :param action_supports: tf.Tensor Opened actions by Progressive Widening of dimensionality
+                                          (K x batch_size x |action_batch| x |action_space|)
+        :param sample_weights: tf.Tensor in [0, 1]^(batch_size). Of the form (batch_size * priority) ^ (-beta)
+        :return: tuple of a tf.Tensor and a list of tf.Tensors containing the total loss and piecewise losses.
+        :see: MuNeuralNet.unroll
+        """
+        loss_monitor = []  # Collect losses for logging.
+
+        # Sum over target probabilities. Absorbing states should have a zero sum --> leaf node.
+        absorb_k = 1.0 - tf.reduce_sum(target_params, axis=(-1, -2))
+
+        # Root inference. Collect predictions of the form: [w_i / K, s, v, r, param] for each forward step k = 0...K
+        predictions = self.unroll(observations, actions)
+
+        # Perform loss computation for each unrolling step.
+        total_loss = tf.constant(0.0, dtype=tf.float32)
+        for k in range(len(predictions)):  # Length = 1 + K (root + hypothetical forward steps)
+            loss_scale, states, vs, rs, params = predictions[k]
+            t_vs, t_rs, t_param = target_vs[k, ...], target_rs[k, ...], target_params[k, ...]
+            action_support = action_supports[k, ...]
+            absorb = absorb_k[k, :]
+
+            # Calculate losses for value heads.
+            r_loss = scalar_loss(rs, t_rs) if (k > 0 and self.fit_rewards) else tf.constant(0, dtype=tf.float32)
+            v_loss = scalar_loss(vs, t_vs)
+
+            # Continuous probability loss by computing log-densities over action support in the batch + entropy.
+            pi_loss, pi_cross_entropy, pi_entropy = self.policy_loss_from_parameters(t_param, params, action_support)
+            pi_loss *= (1.0 - absorb)
+
+            step_loss = scale_gradient(r_loss + v_loss + pi_loss, loss_scale * sample_weights)
+            total_loss += tf.reduce_sum(step_loss)  # Actually averages over batch : see sample_weights.
+
+            # If specified, slightly regularize the dynamics model using the discrepancy between the abstract state
+            # predicted by the dynamics model with the encoder. This penalty should be low to emphasize
+            # value prediction, but may aid stability of learning.
+            if self.net_args.dynamics_penalty > 0 and k > 0:
+                # Infer latent states as predicted by the encoder and cancel the gradients for the encoder
+                encoded_states = self.neural_net.encoder(target_observations[:, (k - 1), ...])
+                encoded_states = tf.stop_gradient(encoded_states)
+
+                contrastive_loss = tf.reduce_sum(tf.keras.losses.MSE(states, encoded_states))
+                total_loss += loss_scale * sample_weights * self.net_args.dynamics_penalty * contrastive_loss
+
+            # Logging
+            loss_monitor.append((v_loss, r_loss, pi_loss, absorb, pi_cross_entropy, pi_entropy))
+
+        # Penalize magnitude of weights using l2 norm
+        l2_norm = tf.reduce_sum([safe_l2norm(x) for x in self.get_variables()])
+        total_loss += self.net_args.l2 * l2_norm
+
+        return total_loss, loss_monitor
+
+    @tf.function
+    def policy_loss_from_parameters(self, targets, parameters, action_support):
+        """
+        Compute neural network policy loss based on action_support and its target probabilities.
+        TODO: Confirm target shape, targets: |batch_size| x |action_support| x |action_space|
+        """
+        dims = action_support.shape  # = (|batch_size|, |action_support|, |action_dimensions|)
+
+        # Format parameter predictions into (|batch_size|, 1, |action_dimensions|) for each parameter.
+        scale_a = tf.reshape(parameters[..., 0], (dims[0], 1, dims[-1]))
+        scale_b = tf.reshape(parameters[..., 1], (dims[0], 1, dims[-1]))
+        dist = self.distribution(scale_a, scale_b, allow_nan_stats=False)
+
+        # |batch_size| x |PW-actions| x |action_dimensions|
+        log_prob = dist.log_prob(action_support)
+
+        # Sum over |action_support|, this yields (cross-) entropy values for each action-dimension.
+        cross_entropy = -tf.reduce_sum(targets * log_prob, axis=-2)
+        entropy = tf.reduce_sum(dist.entropy(), axis=-2)
+
+        # Average over |action_dimensions|.
+        param_loss = tf.reduce_mean(cross_entropy - self.net_args.entropy_penalty * entropy, axis=-1)
+
+        return param_loss, cross_entropy, entropy
+
+    def sample(self, parameters: np.ndarray) -> np.ndarray:
+        return np.clip(np.random.beta(parameters[..., 0], parameters[..., 1]), self.epsilon / 2, 1 - self.epsilon / 2)

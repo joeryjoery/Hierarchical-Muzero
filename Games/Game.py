@@ -34,6 +34,8 @@ class Game(ABC):
         """
         self.n_players = n_players
         self.n_symmetries = 1
+        self.continuous = False
+
         if self.n_players > 2:
             raise NotImplementedError(f"Environments for more than 2 agents are not yet supported, {n_players} > 2")
 

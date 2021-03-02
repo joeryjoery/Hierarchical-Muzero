@@ -13,17 +13,25 @@ from utils.storage import DotDict
 from utils.game_utils import DiscretizeAction
 
 from AlphaZero.AlphaCoach import AlphaZeroCoach
-from MuZero.MuCoach import MuZeroCoach
+from MuZero.MuCoach import MuZeroCoach, ContinuousMuZeroCoach
+from HMuZero.HierarchicalCoach import HierarchicalCoach
 
 from AlphaZero.implementations.DefaultAlphaZero import DefaultAlphaZero as ANet
 from MuZero.implementations.DefaultMuZero import DefaultMuZero as MNet
+from MuZero.implementations.ContinuousMuZero import ContinuousMuZero as CMNet
 from MuZero.implementations.AEMuZero import DecoderMuZero as DMNet
+from HMuZero.NetworkHierarchy import TwoLevelNetworkHierarchy
+from HMuZero.implementations.GoalConditionedMuZero import GCDefaultMuZero, GCContinuousMuZero
+from ModelFree.QLearning import UDQN, UDDPG
+from ModelFree.MFCoach import MFCoach
+from ModelFree.EmptyModel import NullModel
 
 from Games.hex.HexGame import HexGame
 from Games.tictactoe.TicTacToeGame import TicTacToeGame
 from Games.othello.OthelloGame import OthelloGame
 from Games.gym.GymGame import GymGame
 from Games.atari.AtariGame import AtariGame
+from Games.Game import Game
 
 import Experimenter
 import Agents
@@ -86,13 +94,94 @@ def learnM0(g, m0_content: DotDict, m0_run_name: str) -> None:
     c.learn()
 
 
+def learnCM0(g, cm0_content: DotDict, cm0_run_name: str) -> None:
+    """
+    TODO: Doc
+    """
+    print("Testing:", ", ".join(cm0_run_name.split("_")))
+
+    # Extract neural network and algorithm arguments separately
+    net_args, alg_args = cm0_content.net_args, cm0_content.args
+
+    # TODO: Latent decoder?
+    net = CMNet(g, net_args, cm0_content.architecture)
+
+    if alg_args.load_model:
+        print("Load trainExamples from file")
+        net.load_checkpoint(alg_args.load_folder_file[0], alg_args.load_folder_file[1])
+
+    cm0_content.to_json(f'{alg_args.checkpoint}/{cm0_run_name}.json')
+
+    c = ContinuousMuZeroCoach(g, net, alg_args, cm0_run_name)
+    c.learn()
+
+
+def learnHM0(g, hm0_content: DotDict, hm0_run_name: str) -> None:
+    """
+    TODO: Doc
+    """
+    print("Testing:", ", ".join(hm0_run_name.split("_")))
+
+    # Extract neural network and algorithm arguments separately
+    net_args, alg_args = hm0_content.net_args, hm0_content.args
+
+    # Define network/ policies for the higher (goal) and low (action) levels.
+    goal = GCContinuousMuZero if alg_args.plan_goals else UDDPG
+    if g.continuous:
+        act = GCContinuousMuZero if alg_args.plan_actions else UDDPG
+    else:
+        act = GCDefaultMuZero if alg_args.plan_actions else UDQN
+
+    # Wrapper function for initializing the network/ policy hierarchy.
+    def builder(_g, _net_args):
+        return (goal(_g, _net_args, hm0_content.goal_architecture, goal_sampling=True),
+                act(_g, _net_args, hm0_content.action_architecture))
+
+    net = TwoLevelNetworkHierarchy(g, net_args, builder)
+
+    if alg_args.load_model:
+        print("Load trainExamples from file")
+        net.load_checkpoint(alg_args.load_folder_file[0], alg_args.load_folder_file[1])
+
+    hm0_content.to_json(f'{alg_args.checkpoint}/{hm0_run_name}.json')
+
+    c = HierarchicalCoach(g, net, alg_args, hm0_run_name)
+    c.learn()
+
+
+def learnMF(g, mf_content, mf_run_name: str) -> None:
+    """
+    TODO Doc and implement.
+    """
+    print("Testing:", ", ".join(mf_run_name.split("_")))
+
+    # Extract neural network and algorithm arguments separately
+    net_args, alg_args = mf_content.net_args, mf_content.args
+
+    act = UDDPG if g.continuous else UDQN
+
+    def builder(_g, _net_args):
+        return NullModel(_g, _net_args), act(_g, _net_args, mf_content.architecture)
+
+    net = TwoLevelNetworkHierarchy(g, net_args, builder)  # Work around wrapper for code reuse TODO: Refactor.
+
+    if alg_args.load_model:
+        print("Load trainExamples from file")
+        net.load_checkpoint(alg_args.load_folder_file[0], alg_args.load_folder_file[1])
+
+    mf_content.to_json(f'{alg_args.checkpoint}/{mf_run_name}.json')
+
+    c = MFCoach(g, net, alg_args, mf_run_name)
+    c.learn()
+
+
 def get_run_name(config_name: str, architecture: str, game_name: str) -> None:
     """ Macro function to wrap various ModelConfig properties into a run name. """
     time = datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"{config_name}_{architecture}_{game_name}_{time}"
 
 
-def game_from_name(name: str):
+def game_from_name(name: str) -> Game:
     """
     Constructor function to yield a Game class by a query string.
     :param name: str Represents the name/ key of the environment to train on.
@@ -197,7 +286,9 @@ if __name__ == "__main__":
             device = tf.DeviceSpec(device_type='CPU', device_index=0)
 
         with tf.device(device.to_string()):
-            switch = {'ALPHAZERO': learnA0, 'MUZERO': learnM0}
+            switch = {'ALPHAZERO': learnA0, 'MUZERO': learnM0,
+                      'MUZERO_CONTINUOUS': learnCM0, 'MF': learnMF,
+                      'HIERARCHICAL_MUZERO': learnHM0}
             if content.algorithm in switch:
                 switch[content.algorithm](game, content, run_name)
             else:

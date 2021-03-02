@@ -1,0 +1,57 @@
+{
+  "name": "MC_Base",
+  "algorithm": "MF",
+  "architecture": "Gym",
+
+  "args": {
+    "num_selfplay_iterations": 500,
+    "num_episodes": 20,
+    "num_gradient_steps": 40,
+    "max_episode_moves": 500,
+    "max_trial_moves": 500,
+    "pitting": true,
+    "plan_goals": false,
+    "plan_actions": false,
+    "pitting_trials": 10,
+    "pit_acceptance_ratio": 0.0,
+    "exploration_fraction": 0.2,
+    "max_buffer_size": 200000,
+    "n_steps": 10,
+
+    "minimum_reward": null,
+    "maximum_reward": null,
+
+    "checkpoint": "./out/mc_out/mf/",
+    "load_model": false,
+    "load_folder_file": ["./out/mc_out/mf/", "latest.pth.tar"],
+    "selfplay_buffer_window": 20,
+
+    "exploration_schedule": {
+      "method": "linear",
+      "by_weight_update": true,
+      "schedule_points": [[0, 1], [1000, 1], [2000, 0.1], [10000, 0.01]]
+    }
+  },
+
+  "net_args": {
+    "optimizer": {
+      "method": "adam",
+      "lr_init": 0.02,
+      "momentum": 0.9
+    },
+    "goal_space": {
+      "latent": false
+    },
+    "l2": 1e-3,
+    "gamma": 0.99,
+    "target_frequency": 2,
+    "entropy_penalty": 0.1,
+    "dropout": 0.0,
+    "batch_size": 128,
+    "latent_depth": 8,
+    "actor_size": 2,
+    "size_dense": 128,
+    "activation": "elu",
+    "observation_length": 1
+  }
+}

@@ -22,8 +22,17 @@ class GymGame(Game):
         dummy = gym.make(env_name)
         for w in wrappers:
             dummy = w(dummy)
+
+        self.obs_high = dummy.observation_space.high
+        self.obs_low = dummy.observation_space.low
+
         self.dimensions = dummy.observation_space.shape
-        self.actions = dummy.action_space.n
+        if hasattr(dummy.action_space, 'n'):
+            self.actions = dummy.action_space.n
+        else:
+            self.actions = np.prod(dummy.action_space.shape).astype(int)
+            self.wrappers += (lambda e: gym.wrappers.RescaleAction(e, 0, 1),)  # Normalize action-space to (0, 1)
+            self.continuous = True
 
     def getDimensions(self, **kwargs) -> typing.Tuple[int, ...]:
         return self.dimensions if len(self.dimensions) > 1 else (1, 1, *self.dimensions)
@@ -41,7 +50,8 @@ class GymGame(Game):
 
         return next_state
 
-    def getNextState(self, state: GymState, action: int, **kwargs) -> typing.Tuple[GymState, float]:
+    def getNextState(self, state: GymState, action: typing.Union[int, np.ndarray], **kwargs) -> typing.Tuple[GymState,
+                                                                                                             float]:
         def nextEnv(old_state: GymState, clone: bool = False):  # Macro for cloning the state
             return deepcopy(old_state.env) if clone else old_state.env
 

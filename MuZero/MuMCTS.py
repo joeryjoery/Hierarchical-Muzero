@@ -22,14 +22,15 @@ import typing
 
 import numpy as np
 
-from MuZero.MuNeuralNet import MuZeroNeuralNet
+from Interface import SearchBase
+from MuZero.MuNeuralNet import MuZeroNeuralNet, MuZeroContinuousNeuralNet
 from utils import DotDict
 from utils.selfplay_utils import MinMaxStats, GameHistory, GameState
 
 EPS = 1e-8
 
 
-class MuZeroMCTS:
+class MuZeroMCTS(SearchBase):
     """
     This class handles the MCTS tree within the neural network embedding.
     """
@@ -41,9 +42,7 @@ class MuZeroMCTS:
         :param neural_net: MuNeuralNet Implementation of MuNeuralNet class for inference.
         :param args: DotDict Data structure containing parameters for the tree search.
         """
-        self.game = game
-        self.neural_net = neural_net
-        self.args = args
+        super().__init__(game, neural_net, args)
 
         # Static helper variables to remove references to the 'game' object.
         self.single_player = game.n_players == 1
@@ -60,8 +59,13 @@ class MuZeroMCTS:
         self.Ns = {}   # stores #times board s was visited
         self.Ps = {}   # stores initial policy (returned by neural net)
         self.Vs = {}   # stores valid moves at the ROOT node.
+        self.As = {}   # stores all available actions at s (almost always just list(range(action_size))
 
-    def clear_tree(self) -> None:
+    def action_space(self, s: typing.Tuple[bytes, tuple], **kwargs) -> typing.List:
+        """ Wrapper function for requisite action space abstraction. :see: MuZeroContinuousMCTS """
+        return self.As[s]
+
+    def refresh(self) -> None:
         """ Clear all statistics stored in the current search tree """
         self.Qsa, self.Ssa, self.Rsa, self.Nsa, self.Ns, self.Ps, self.Vs = [{} for _ in range(7)]
 
@@ -81,6 +85,7 @@ class MuZeroMCTS:
         latent_state, pi_0, v_0 = self.neural_net.initial_inference(stacked_observations)
 
         s_0 = (latent_state.tobytes(), tuple())  # Hashable representation
+        self.As[s_0] = list(range(self.action_size))  # Initialize all available actions.
 
         # Add Dirichlet Exploration noise
         noise = np.random.dirichlet([self.args.dirichlet_alpha] * len(pi_0))
@@ -119,10 +124,11 @@ class MuZeroMCTS:
         c_children = np.max([self.Ns[s], 1e-8])  # Ensure that prior doesn't collapse to 0 if s is new.
 
         ucb = self.Ps[s][a] * np.sqrt(c_children) / (1 + visit_count) * exploration_factor  # Exploration
-        ucb += q_value                                                                      # Exploitation
+        ucb += q_value  # Exploitation
         return ucb
 
-    def runMCTS(self, state: GameState, trajectory: GameHistory, temp: float = 1.0) -> typing.Tuple[np.ndarray, float]:
+    def runMCTS(self, state: GameState, trajectory: GameHistory, temp: float = 1.0) -> typing.Tuple[np.ndarray,
+                                                                                                    np.ndarray, float]:
         """
         This function performs 'num_MCTS_sims' simulations of MCTS starting from the provided root GameState.
 
@@ -138,11 +144,12 @@ class MuZeroMCTS:
         :param state: GameState Data structure containing the current state of the environment.
         :param trajectory: GameHistory Data structure containing the entire episode trajectory of the agent(s).
         :param temp: float Visit count exponentiation factor. A value of 0 = Greedy, +infinity = uniformly random.
-        :return: tuple (pi, v) The move probabilities of MCTS and the estimated root-value of the policy.
+        :return: tuple (a, pi, v) The action-space and respective probability distribution and estimated root-value
+                                  of the policy computed by MCTS.
         """
         # Refresh value bounds and statistics in the tree
         self.minmax.refresh()
-        self.clear_tree()
+        self.refresh()
 
         # Initialize the root variables needed for MCTS.
         s_0, latent_state, v_0 = self.initialize_root(state, trajectory)
@@ -152,7 +159,7 @@ class MuZeroMCTS:
         v = (v_0 + (v_search if self.single_player else -v_search)) / self.args.num_MCTS_sims
 
         # MCTS Visit count array for each edge 'a' from root node 's_0'.
-        counts = np.array([self.Nsa[(s_0, a)] if (s_0, a) in self.Nsa else 0 for a in range(self.action_size)])
+        counts = np.array([self.Nsa[(s_0, a)] if (s_0, a) in self.Nsa else 0 for a in self.action_space(s_0)])
         counts = counts * self.Vs[s_0]  # Mask illegal moves.
 
         if temp == 0:  # Greedy selection. One hot encode the most visited paths (uniformly random break ties).
@@ -162,7 +169,7 @@ class MuZeroMCTS:
             counts = np.power(counts, 1. / temp)
             move_probabilities = counts / np.sum(counts)
 
-        return move_probabilities, v
+        return np.asarray(self.action_space(s_0)), move_probabilities, v
 
     def _search(self, latent_state: np.ndarray, path: typing.Tuple[int, ...] = tuple()) -> float:
         """
@@ -191,23 +198,26 @@ class MuZeroMCTS:
         ### SELECTION
         # pick the action with the highest upper confidence bound
         exploration_factor = self.args.c1 + np.log(self.Ns[s_k] + self.args.c2 + 1) - np.log(self.args.c2)
-        confidence_bounds = [self.compute_ucb(s_k, a, exploration_factor) for a in range(self.action_size)]
-        a = np.argmax(confidence_bounds).item()
+        confidence_bounds = [self.compute_ucb(s_k, a, exploration_factor) for a in self.action_space(s_k, expand=True)]
+        a = self.As[s_k][np.argmax(confidence_bounds).item()]  # Argmax is used as index for generality.
 
         if (s_k, a) not in self.Ssa:  ### ROLLOUT
             # Perform a forward pass in the dynamics function.
             reward, next_latent, prior, value = self.neural_net.recurrent_inference(latent_state, a)
-            s_k_next = (next_latent.tobytes(), path + (a, ))              # Hashable representation.
+            s_k_next = (next_latent.tobytes(), path + (a, ))  # Hashable representation.
 
-            self.Rsa[(s_k, a)], self.Ssa[(s_k, a)] = reward, next_latent  # Current depth statistics
-            self.Ps[s_k_next], self.Ns[s_k_next] = prior, 0               # Next depth statistics
-            value = value if self.single_player else -value               # Alternate value perspective for adversary.
+            # Current depth statistics
+            self.Rsa[(s_k, a)], self.Ssa[(s_k, a)] = reward, next_latent
+            # Next depth statistics
+            self.Ps[s_k_next], self.Ns[s_k_next], self.As[s_k_next] = prior, 0, list(range(self.action_size))
+            # Alternate value perspective for adversary.
+            value = value if self.single_player else -value
 
         else:  ### EXPANSION
-            value = self._search(self.Ssa[(s_k, a)], path + (a, ))        # 1-step look ahead state value
+            value = self._search(self.Ssa[(s_k, a)], path + (a, ))  # 1-step look ahead state value
 
         ### BACKUP
-        gk = self.Rsa[(s_k, a)] + self.args.gamma * value                 # (Discounted) Value of the current node
+        gk = self.Rsa[(s_k, a)] + self.args.gamma * value  # (Discounted) Value of the current node
 
         if (s_k, a) in self.Qsa:
             self.Qsa[(s_k, a)] = (self.Nsa[(s_k, a)] * self.Qsa[(s_k, a)] + gk) / (self.Nsa[(s_k, a)] + 1)
@@ -220,3 +230,99 @@ class MuZeroMCTS:
         self.Ns[s_k] += 1
 
         return gk if self.single_player else -gk
+
+
+class MuZeroContinuousMCTS(MuZeroMCTS):
+    """
+    This class handles the MCTS tree within the neural network embedding.
+    References:
+        - A0C Alpha Zero in Continuous Action Space: https://arxiv.org/abs/1805.09613
+        - Continuous Upper Confidence Trees: https://hal.archives-ouvertes.fr/hal-00542673v2/document
+    """
+
+    def __init__(self, game, neural_net: MuZeroContinuousNeuralNet, args: DotDict) -> None:
+        """
+        Initialize all requisite variables for performing *Continuous* MCTS for MuZero.
+        :param game: Game Implementation of Game class for environment logic.
+        :param neural_net: MuNeuralNet Implementation of MuZeroContinuousNeuralNet class for inference.
+        :param args: DotDict Data structure containing parameters for the tree search.
+        """
+        super().__init__(game, neural_net, args)
+        # Set action_size to 0 for initial state of Progressive Widening.
+        self.action_size = 0
+        self.neural_net = neural_net  # Override typing interface for child class.
+
+    def action_space(self, s: typing.Tuple[bytes, tuple], expand: bool = False) -> typing.List:
+        """ Override base getter for Progressive Widening: |a(s)| = ceil(C * n(s) ^ alpha) """
+        # Only expand actions when accessing action_space within the MCTS-loop (not during prob. calculation).
+        if expand:
+            while len(self.As[s]) < np.ceil(self.args.c_pw * self.Ns[s] ** self.args.alpha_pw) or not self.As[s]:
+                self.As[s].append(tuple(self.neural_net.sample(self.Ps[s])))
+
+        # print("Progressive widening", len(self.As[s]))
+        return self.As[s]
+
+    def refresh(self) -> None:
+        """ Clear all statistics stored in the current search tree """
+        super().refresh()
+
+    def initialize_root(self, state: GameState, trajectory: GameHistory) -> typing.Tuple[typing.Tuple[bytes, tuple],
+                                                                                         np.ndarray, float]:
+        """
+        Embed the provided root state into the MuZero Neural Network. Additionally perform inference for
+        this root state and perturb the network parameterized distribution with a Gaussian prior.
+        TODO: Condition the parameterized distribution of the continuous space for environment constraints at the root.
+        :param state: GameState Data structure containing the current state of the environment.
+        :param trajectory: GameHistory Data structure containing the entire episode trajectory of the agent(s).
+        :return: tuple (hash, latent_state, root_value) The hash/ data of the latent state and inferred root-value.
+        """
+        # Perform initial inference on o_t-l, ... o_t
+        o_t = self.game.buildObservation(state)
+        stacked_observations = trajectory.stackObservations(self.neural_net.net_args.observation_length, o_t)
+        latent_state, p_0, v_0 = self.neural_net.initial_inference(stacked_observations)
+
+        s_0 = (latent_state.tobytes(), tuple())  # Hashable representation
+
+        self.As[s_0] = list(range(self.action_size))   # Initialize list of sampled actions during = 0 at the root.
+
+        # Initialize parameters of action sampling distribution perturbed by a uniform Beta parameterization.
+        noise = np.ones((2, len(p_0))).reshape(-1, 2)
+        self.Ps[s_0] = noise * self.args.exploration_fraction + (1 - self.args.exploration_fraction) * p_0
+
+        # Sum of visit counts of the edges/ children
+        self.Ns[s_0] = 0
+
+        # TODO: Unconstrained optimization -> Constrained optimization at the root?
+        self.Vs[s_0] = 1
+
+        return s_0, latent_state, v_0
+
+    def compute_ucb(self, s: typing.Tuple[bytes, tuple], a: int, exploration_factor: float) -> float:
+        """
+        Compute the UCT formula for a Continuous MuZero Agent for an open edge (s, a) inside the MCTS tree:
+
+            PUCT(s, a) = MinMaxNormalize(Q(s, a)) + sqrt(visits_parent / (1 + visits_s)) * exploration_factor
+
+        The Q values within the tree are MinMax normalized over the accumulated statistics over the current tree search.
+        There is no prior term in the Continuous UCT -> Uniform. Sampled actions during Progressive Widening should
+        account for the distributional prior from the MuZero agent.
+
+        :param s: tuple Hashable key of the current-state inside the MCTS tree.
+        :param a: int Action key representing the path to reach the child node from path (s, a)
+        :param exploration_factor: float Pre-computed exploration factor from the MuZero PUCT formula.
+        :return: float Upper confidence bound
+        """
+        if (s, a) not in self.Nsa:  # Newly opened actions receive highest priority.
+            return np.inf
+
+        visit_count = self.Nsa[(s, a)]
+        q_value = self.minmax.normalize(self.Qsa[(s, a)]) if (s, a) in self.Qsa else 0
+        c_children = np.max([self.Ns[s], 1e-8])  # Ensure that prior doesn't collapse to 0 if s is new.
+
+        # Uniform Prior in Continuous MCTS.
+        # TODO: Why not SoftMax densities: f(Action; E[Action], Var[Action]) over all Actions?
+        #  As new Actions get added -> probabilities get shifted -> counterbalance with temperature?
+        #   -> Open all actions at once?
+        #   -> Future work
+        ucb = q_value + np.sqrt(c_children) / visit_count * exploration_factor  # TODO: div by visit_count not +1
+        return ucb

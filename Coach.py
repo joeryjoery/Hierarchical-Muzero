@@ -25,12 +25,8 @@ from utils.selfplay_utils import GameHistory, ParameterScheduler
 from utils import debugging
 
 
-class Coach(ABC):
-    """
-    This class controls the self-play and learning loop. Subclass this abstract class to define implementation
-    specific procedures for sampling data for the learning algorithm. See MuZero/MuNeuralNet.py or
-    AlphaZero/AlphaNeuralNet.py for examples.
-    """
+class CoachBase(ABC):
+    """ Base logic and framework for controlling an agent-environment loop including storage of experience. """
 
     def __init__(self, game, neural_net, args: DotDict, search_engine, player) -> None:
         """
@@ -51,25 +47,33 @@ class Coach(ABC):
 
         # Initialize network and search engine
         self.neural_net = neural_net
-        self.mcts = search_engine(self.game, self.neural_net, self.args)
+        self.search_engine = search_engine(self.game, self.neural_net, self.args)
         self.arena_player = player(self.game, None)
-        self.arena_player.set_variables(self.neural_net, self.mcts, 'p1')
+        self.arena_player.set_variables(self.neural_net, self.search_engine, 'p1')
 
         # Initialize adversary if specified.
         if self.args.pitting:
             self.opponent_net = self.neural_net.__class__(self.game, neural_net.net_args, neural_net.architecture)
-            self.opponent_mcts = search_engine(self.game, self.opponent_net, self.args)
+            self.opponent_search_engine = search_engine(self.game, self.opponent_net, self.args)
             self.arena_opponent = player(self.game, None)
-            self.arena_opponent.set_variables(self.opponent_net, self.opponent_mcts, 'p2')
-
-        # Initialize MCTS visit count exponentiation factor schedule.
-        self.temp_schedule = ParameterScheduler(self.args.temperature_schedule)
-        self.update_temperature = self.temp_schedule.build()
+            self.arena_opponent.set_variables(self.opponent_net, self.opponent_search_engine, 'p2')
 
     @staticmethod
     def getCheckpointFile(iteration: int) -> str:
         """ Helper function to format model checkpoint filenames """
         return f'checkpoint_{iteration}.pth.tar'
+
+    @abstractmethod
+    def executeEpisode(self) -> GameHistory:
+        """
+        Perform one episode of self-play for gathering data to train neural networks on.
+
+        The implementation details of the neural networks/ agents, temperature schedule, data storage
+        is kept highly transparent on this side of the algorithm. Hence for implementation details
+        see the specific implementations of the function calls.
+
+        :return: GameHistory Data structure containing all observed states and statistics required for network training.
+        """
 
     @abstractmethod
     def sampleBatch(self, histories: typing.List[GameHistory]) -> typing.List:
@@ -82,49 +86,30 @@ class Coach(ABC):
         :return: List of training examples.
         """
 
-    def executeEpisode(self) -> GameHistory:
+    def do_self_play(self) -> typing.List[GameHistory]:
+        # Self-play/ Gather training data.
+        iteration_train_examples = list()
+        for _ in trange(self.args.num_episodes, desc="Self Play", file=sys.stdout):
+            self.search_engine.refresh()
+            iteration_train_examples.append(self.executeEpisode())
+
+            if sum(map(len, iteration_train_examples)) > self.args.max_buffer_size:
+                iteration_train_examples.pop(0)
+
+        return iteration_train_examples
+
+    def update_parameters(self, training_data: typing.List[GameHistory]) -> None:
         """
-        Perform one episode of self-play for gathering data to train neural networks on.
-
-        The implementation details of the neural networks/ agents, temperature schedule, data storage
-        is kept highly transparent on this side of the algorithm. Hence for implementation details
-        see the specific implementations of the function calls.
-
-        At every step we record a snapshot of the state into a GameHistory object, this includes the observation,
-        MCTS search statistics, performed action, and observed rewards. After the end of the episode, we close the
-        GameHistory object and compute internal target values.
-
-        :return: GameHistory Data structure containing all observed states and statistics required for network training.
+        Update the current neural network configurations in-place. The training loop samples batches from the given
+        history of self-play episodes, performs backprop/ gradient descent, and monitors loss statistics.
+        :param training_data: List of GameHistory objects to update the network parameters on.
         """
-        history = GameHistory()
-        state = self.game.getInitialState()  # Always from perspective of player 1 for boardgames.
-        step = 0
+        # Backpropagation
+        for _ in trange(self.args.num_gradient_steps, desc="Backpropagation", file=sys.stdout):
+            batch = self.sampleBatch(training_data)
 
-        while not state.done and step < self.args.max_episode_moves:
-            if debugging.RENDER:  # Display visualization of the environment if specified.
-                self.game.render(state)
-
-            # Update MCTS visit count temperature according to an episode or weight update schedule.
-            temp = self.update_temperature(self.neural_net.steps if self.temp_schedule.args.by_weight_update else step)
-
-            # Compute the move probability vector and state value using MCTS for the current state of the environment.
-            pi, v = self.mcts.runMCTS(state, history, temp=temp)
-
-            # Take a step in the environment and observe the transition and store necessary statistics.
-            state.action = np.random.choice(len(pi), p=pi)
-            next_state, r = self.game.getNextState(state, state.action)
-            history.capture(state, pi, r, v)
-
-            # Update state of control
-            state = next_state
-            step += 1
-
-        # Cleanup environment and GameHistory
-        self.game.close(state)
-        history.terminate()
-        history.compute_returns(gamma=self.args.gamma, n=(self.args.n_steps if self.game.n_players == 1 else None))
-
-        return history
+            self.neural_net.train(batch)
+            self.neural_net.monitor.log_batch(batch)
 
     def learn(self) -> None:
         """
@@ -139,36 +124,24 @@ class Coach(ABC):
             print(f'------ITER {i}------')
             if not self.update_on_checkpoint or i > 1:  # else: go directly to backpropagation
 
-                # Self-play/ Gather training data.
-                iteration_train_examples = list()
-                for _ in trange(self.args.num_episodes, desc="Self Play", file=sys.stdout):
-                    self.mcts.clear_tree()
-                    iteration_train_examples.append(self.executeEpisode())
-
-                    if sum(map(len, iteration_train_examples)) > self.args.max_buffer_size:
-                        iteration_train_examples.pop(0)
+                # Gather training data using the agent's current parameters.
+                new_training_data = self.do_self_play()
 
                 # Store data from previous self-play iterations into the history.
-                self.trainExamplesHistory.append(iteration_train_examples)
+                self.trainExamplesHistory.append(new_training_data)
 
             # Print out statistics about the replay buffer, and back-up the data history to a file (can be slow).
             GameHistory.print_statistics(self.trainExamplesHistory)
             self.saveTrainExamples(i - 1)
 
-            # Flatten examples over self-play episodes and sample a training batch.
+            # Flatten examples over self-play episodes and update the neural network using the current training data.
             complete_history = GameHistory.flatten(self.trainExamplesHistory)
 
-            # Training new network, keeping a copy of the old one
+            # Keep a copy of the old network before updating parameters (for approximate monotonicity if specified).
             self.neural_net.save_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
+            self.update_parameters(complete_history)
 
-            # Backpropagation
-            for _ in trange(self.args.num_gradient_steps, desc="Backpropagation", file=sys.stdout):
-                batch = self.sampleBatch(complete_history)
-
-                self.neural_net.train(batch)
-                self.neural_net.monitor.log_batch(batch)
-
-            # Pitting
+            # Pitting for approximate monotonicity
             accept = True
             if self.args.pitting:
                 # Load in the old network.
@@ -219,3 +192,68 @@ class Coach(ABC):
             print(f"Data file {examples_file} found. Read it.")
             with open(examples_file, "rb") as f:
                 self.trainExamplesHistory = Unpickler(f).load()
+
+
+class Coach(CoachBase, ABC):
+    """
+    This class controls the self-play and learning loop. Subclass this abstract class to define implementation
+    specific procedures for sampling data for the learning algorithm. See MuZero/MuNeuralNet.py or
+    AlphaZero/AlphaNeuralNet.py for examples.
+    """
+
+    def __init__(self, game, neural_net, args: DotDict, search_engine, player) -> None:
+        """ Call super constructor and additionally initialize a MCTS temeprature schedule."""
+        super().__init__(game, neural_net, args, search_engine, player)
+
+        # Initialize MCTS visit count exponentiation factor schedule.
+        self.temp_schedule = ParameterScheduler(self.args.temperature_schedule)
+        self.update_temperature = self.temp_schedule.build()
+
+    @property
+    def store_action_support(self) -> bool:
+        """ Boolean property that the Continuous MuZero/ AlphaZero implementation depends on. False by default. """
+        return False
+
+    def executeEpisode(self) -> GameHistory:
+        """
+        Perform one episode of self-play for gathering data to train neural networks on.
+
+        The implementation details of the neural networks/ agents, temperature schedule, data storage
+        is kept highly transparent on this side of the algorithm. Hence for implementation details
+        see the specific implementations of the function calls.
+
+        At every step we record a snapshot of the state into a GameHistory object, this includes the observation,
+        MCTS search statistics, performed action, and observed rewards. After the end of the episode, we close the
+        GameHistory object and compute internal target values.
+
+        :return: GameHistory Data structure containing all observed states and statistics required for network training.
+        """
+        history = GameHistory()
+        state = self.game.getInitialState()  # Always from perspective of player 1 for boardgames.
+        step = 0
+
+        while not state.done and step < self.args.max_episode_moves:
+            if debugging.RENDER:  # Display visualization of the environment if specified.
+                self.game.render(state)
+
+            # Update MCTS visit count temperature according to an episode or weight update schedule.
+            temp = self.update_temperature(self.neural_net.steps if self.temp_schedule.args.by_weight_update else step)
+
+            # Compute the move probability vector and state value using MCTS for the current state of the environment.
+            action_space, pi, v = self.search_engine.runMCTS(state, history, temp=temp)
+
+            # Take a step in the environment and observe the transition and store necessary statistics.
+            state.action = action_space[np.random.choice(len(action_space), p=pi)]
+            next_state, r = self.game.getNextState(state, state.action)
+            history.capture(state, pi, r, v, (action_space if self.store_action_support else None))
+
+            # Update state of control
+            state = next_state
+            step += 1
+
+        # Cleanup environment and GameHistory
+        self.game.close(state)
+        history.terminate()
+        history.compute_returns(gamma=self.args.gamma, n=(self.args.n_steps if self.game.n_players == 1 else None))
+
+        return history

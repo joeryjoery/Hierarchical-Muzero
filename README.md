@@ -11,3 +11,10 @@ An adaptation of MuZero to the hierarchical reinforcement learning framework.
 
 
 
+# TODO
+ - Rework data Collection
+ - Universal Value Function Approximation (only f? or also r in g?)
+ - Hierarchical structure neural network
+
+
+

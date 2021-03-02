@@ -24,6 +24,9 @@ class GameState:
 class GymState(GameState):
     env: Env        # Class for the (stateful) logic of Gym Environments at t.
 
+    def __del__(self):
+        self.env.close()
+
 
 @dataclass
 class AtariState(GymState):

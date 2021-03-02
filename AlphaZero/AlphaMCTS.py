@@ -15,6 +15,7 @@ import typing
 
 import numpy as np
 
+from Interface import SearchBase
 from AlphaZero.AlphaNeuralNet import AlphaZeroNeuralNet
 from utils import DotDict
 from utils.selfplay_utils import MinMaxStats, GameHistory, GameState
@@ -22,7 +23,7 @@ from utils.selfplay_utils import MinMaxStats, GameHistory, GameState
 EPS = 1e-8
 
 
-class MCTS:
+class MCTS(SearchBase):
     """
     This class handles the MCTS tree while having access to the environment logic.
     """
@@ -35,9 +36,7 @@ class MCTS:
         :param neural_net: AlphaNeuralNet Implementation of AlphaNeuralNet class for inference.
         :param args: DotDict Data structure containing parameters for the tree search.
         """
-        self.game = game
-        self.neural_net = neural_net
-        self.args = args
+        super().__init__(game, neural_net, args)
 
         # Static helper variables.
         self.single_player = game.n_players == 1
@@ -54,7 +53,7 @@ class MCTS:
         self.Ps = {}   # stores initial policy (returned by neural net)
         self.Vs = {}   # stores game.getValidMoves for board s
 
-    def clear_tree(self) -> None:
+    def refresh(self) -> None:
         """ Clear all statistics stored in the current search tree """
         self.Qsa, self.Ssa, self.Rsa, self.Nsa, self.Ns, self.Ps, self.Vs = [{} for _ in range(7)]
 
@@ -121,7 +120,8 @@ class MCTS:
         ucb += q_value  # Exploitation
         return ucb
 
-    def runMCTS(self, state: GameState, trajectory: GameHistory, temp: int = 1) -> typing.Tuple[np.ndarray, float]:
+    def runMCTS(self, state: GameState, trajectory: GameHistory, temp: int = 1) -> typing.Tuple[np.ndarray,
+                                                                                                np.ndarray, float]:
         """
         This function performs 'num_MCTS_sims' simulations of MCTS starting from the provided root GameState.
 
@@ -137,7 +137,8 @@ class MCTS:
         :param state: GameState Data structure containing the current state of the environment.
         :param trajectory: GameHistory Data structure containing the entire episode trajectory of the agent(s).
         :param temp: float Visit count exponentiation factor. A value of 0 = Greedy, +infinity = uniformly random.
-        :return: tuple (pi, v) The move probabilities of MCTS and the estimated root-value of the policy.
+        :return: tuple (a, pi, v) The action-space and respective probability distribution and estimated root-value
+                                  of the policy computed by MCTS.
         """
         # Refresh value bounds in the tree
         self.minmax.refresh()
@@ -159,7 +160,7 @@ class MCTS:
             counts = np.power(counts, 1. / temp)
             move_probabilities = counts / np.sum(counts)
 
-        return move_probabilities, v
+        return np.arange(len(move_probabilities)), move_probabilities, v
 
     def _search(self, state: GameState, trajectory: GameHistory, path: typing.Tuple[int, ...] = tuple()) -> float:
         """

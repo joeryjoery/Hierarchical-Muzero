@@ -9,6 +9,7 @@ import numpy as np
 
 from utils.game_utils import GameState
 from utils.selfplay_utils import GameHistory
+from utils.HierarchicalUtils import GoalState
 from utils import DotDict
 
 from AlphaZero.implementations.DefaultAlphaZero import DefaultAlphaZero
@@ -16,6 +17,10 @@ from AlphaZero.AlphaMCTS import MCTS as AlphaZeroMCTS
 from MuZero.implementations.DefaultMuZero import DefaultMuZero
 from MuZero.implementations.BlindMuZero import BlindMuZero
 from MuZero.MuMCTS import MuZeroMCTS
+from HMuZero.PolicyHierarchy import PolicyHierarchy
+from HMuZero.NetworkHierarchy import TwoLevelNetworkHierarchy
+from ModelFree.EmptyModel import NullModel
+from ModelFree.QLearning import UDQN, UDDPG
 
 
 class Player(ABC):
@@ -51,7 +56,7 @@ class Player(ABC):
 
     def observe(self, state: GameState) -> None:
         """ Capture an environment state observation within the agent's memory. """
-        self.history.capture(state, np.array([]), 0, 0)
+        self.history.capture(state, np.array([]), 0, 0, np.array([]))
 
     def clone(self):
         """ Create a new instance of this Player object using equivalent parameterization """
@@ -90,12 +95,12 @@ class DefaultAlphaZeroPlayer(Player):
     def refresh(self, hard_reset: bool = False):
         """ Refresh internal state of the Agent along with stored statistics within the MCTS tree """
         super().refresh()
-        self.search_engine.clear_tree()
+        self.search_engine.refresh()
 
     def act(self, state: GameState) -> int:
         """ Sample actions using MCTS using the given environment model. """
-        pi, _ = self.search_engine.runMCTS(state, self.history, temp=0)
-        return np.argmax(pi).item()
+        actions, pi, _ = self.search_engine.runMCTS(state, self.history, temp=0)
+        return actions[np.argmax(pi).item()]
 
 
 class DefaultMuZeroPlayer(Player):
@@ -122,12 +127,12 @@ class DefaultMuZeroPlayer(Player):
     def refresh(self, hard_reset: bool = False) -> None:
         """ Refresh internal state of the Agent along with stored statistics within the MCTS tree """
         super().refresh()
-        self.search_engine.clear_tree()
+        self.search_engine.refresh()
 
     def act(self, state: GameState) -> int:
         """ Samples actions using MCTS within the learned RNN/ MDP model. """
-        pi, _ = self.search_engine.runMCTS(state, self.history, temp=0)
-        return np.argmax(pi).item()
+        actions, pi, _ = self.search_engine.runMCTS(state, self.history, temp=0)
+        return actions[np.argmax(pi).item()]
 
 
 class BlindMuZeroPlayer(Player):
@@ -162,7 +167,7 @@ class BlindMuZeroPlayer(Player):
         embedding.
         """
         super().refresh()
-        self.search_engine.clear_tree()
+        self.search_engine.refresh()
         # Reset trajectory within the learned model back to the embedding function.
         self.model.reset()
         self.model.bind(self.history.actions)
@@ -173,8 +178,75 @@ class BlindMuZeroPlayer(Player):
         current observation (only when refreshed by the schedule) but starts from the last step within the
         learned model trajectory.
         """
-        pi, _ = self.search_engine.runMCTS(state, self.history, temp=0)
-        return np.argmax(pi).item()
+        actions, pi, _ = self.search_engine.runMCTS(state, self.history, temp=0)
+        return actions[np.argmax(pi).item()]
+
+
+class HierarchicalMuZeroPlayer(Player):
+
+    def __init__(self, game, arg_file: typing.Optional[str] = None, name: str = "") -> None:
+        super().__init__(game, arg_file, name, parametric=True)
+        if self.player_args is not None:
+            # Initialize MuZero by loading its parameter config and constructing the network and search classes.
+            self.args = DotDict.from_json(self.player_args)
+
+            self.model = TwoLevelNetworkHierarchy(self.game, self.args.net_args, self.args.architecture)
+            self.search_engine = PolicyHierarchy(self.game, self.model, self.args.args)
+            self.name = self.args.name
+            self.goal = GoalState(None, 0, True, 0)
+
+    def set_variables(self, model, search_engine, name: str) -> None:
+        """ Assign Neural Network and Search class to an external reference """
+        self.model = model
+        self.search_engine = search_engine
+        self.name = name
+        self.args = self.search_engine.args
+        self.goal = GoalState(None, 0, True, 0)
+
+    def update_goal(self, current_state: GameState, goal: GoalState) -> GoalState:
+        if goal.goal is None:
+            return goal
+
+        goal.age += 1
+        goal.achieved = self.search_engine.goal_achieved(current_state.observation, goal.goal)
+        return goal
+
+    def act(self, state: GameState) -> int:
+
+        goal = self.update_goal(state, self.goal)
+        if goal.achieved or goal.age >= self.args.goal_horizon:
+            self.goal, _ = self.search_engine.sample_goal(state, self.history, 0)
+        a, _ = self.search_engine.sample_action(state, self.history, self.goal, 0.0)
+
+        return a
+
+
+class ModelFreePlayer(Player):
+
+    def __init__(self, game, arg_file: typing.Optional[str] = None, name: str = "") -> None:
+        super().__init__(game, arg_file, name, parametric=True)
+        if self.player_args is not None:
+            # Initialize MuZero by loading its parameter config and constructing the network and search classes.
+            self.args = DotDict.from_json(self.player_args)
+
+            act = UDDPG if game.continuous else UDQN
+
+            def builder(_g, _net_args):
+                return NullModel(_g, _net_args), act(_g, _net_args, self.args.architecture)
+
+            self.model = TwoLevelNetworkHierarchy(game, self.args.net_args, builder)
+            self.search_engine = PolicyHierarchy(self.game, self.model, self.args.args)
+            self.name = self.args.name
+
+    def set_variables(self, model, search_engine, name: str) -> None:
+        """ Assign Neural Network and Search class to an external reference """
+        self.model = model
+        self.search_engine = search_engine
+        self.name = name
+
+    def act(self, state: GameState) -> int:
+        a, _ = self.search_engine.sample_action(state, self.history, self.model.goal_net.current_goal, 0)
+        return a
 
 
 class RandomPlayer(Player):

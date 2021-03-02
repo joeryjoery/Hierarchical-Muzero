@@ -3,6 +3,7 @@ Defines the functionality for prioritized sampling, the replay-buffer, min-max n
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
 import typing
 
 import numpy as np
@@ -12,24 +13,80 @@ from utils.game_utils import GameState
 
 
 @dataclass
-class GameHistory:
-    """
-    Data container for keeping track of game trajectories.
-    """
-    observations: list = field(default_factory=list)        # o_t: State Observations
-    players: list = field(default_factory=list)             # p_t: Current player
-    probabilities: list = field(default_factory=list)       # pi_t: Probability vector of MCTS for the action
-    search_returns: list = field(default_factory=list)      # v_t: MCTS value estimation
-    rewards: list = field(default_factory=list)             # u_t+1: Observed reward after performing a_t+1
-    actions: list = field(default_factory=list)             # a_t+1: Action leading to transition s_t -> s_t+1
-    observed_returns: list = field(default_factory=list)    # z_t: Training targets for the value function
-    terminated: bool = False                                # Whether the environment has terminated
+class IGameHistory(ABC):
+
+    @abstractmethod
+    def refresh(self) -> None:
+        """ Clear all current statistics. """
+
+    @abstractmethod
+    def terminate(self) -> None:
+        """ Truncate/ end all stored statistics such that the buffer has a strict and clear ending. """
+
+    @staticmethod
+    def print_statistics(histories: typing.List[typing.List[IGameHistory]]) -> None:
+        """ Print generic statistics over a nested list of GameHistories (the entire Replay-Buffer). """
+        flat = GameHistory.flatten(histories)
+
+        n_self_play_iterations = len(histories)
+        n_episodes = len(flat)
+        n_samples = sum([len(x) for x in flat])
+
+        print("=== Replay Buffer Statistics ===")
+        print(f"Replay buffer filled with data from {n_self_play_iterations} self play iterations")
+        print(f"In total {n_episodes} episodes have been played amounting to {n_samples} data samples")
+
+    @staticmethod
+    def flatten(nested_histories: typing.List[typing.List[IGameHistory]]) -> typing.List[IGameHistory]:
+        """ Flatten doubly nested list to a normal list of objects. """
+        return [subitem for item in nested_histories for subitem in item]
+
+
+@dataclass
+class BaseGameHistory(IGameHistory):
+    observations: list = field(default_factory=list)  # o_t: State Observations
+    rewards: list = field(default_factory=list)       # u_t+1: Observed reward after performing a_t+1
+    actions: list = field(default_factory=list)       # a_t+1: Action leading to transition s_t -> s_t+1
+
+    terminated: bool = False                          # Whether the environment has terminated
 
     def __len__(self) -> int:
         """Get length of current stored trajectory"""
         return len(self.observations)
 
-    def capture(self, state: GameState, pi: np.ndarray, r: float, v: float) -> None:
+    def refresh(self) -> None:
+        all([x.clear() for x in vars(self).values() if type(x) == list])
+
+    def terminate(self) -> None:
+        self.rewards.append(0)
+        self.terminated = True
+
+
+@dataclass
+class MFGameHistory(BaseGameHistory):
+    next_observations: list = field(default_factory=list)
+
+    def capture(self, state: GameState, next_state: GameState, r: float) -> None:
+        self.observations.append(state.observation)
+        self.next_observations.append(next_state.observation)
+        self.actions.append(state.action)
+        self.rewards.append(r)
+
+
+@dataclass
+class GameHistory(BaseGameHistory):
+    """
+    Data container for keeping track of game trajectories.
+    """
+    players: list = field(default_factory=list)             # p_t: Current player
+    probabilities: list = field(default_factory=list)       # pi_t: Probability vector of MCTS for the action
+    search_returns: list = field(default_factory=list)      # v_t: MCTS value estimation
+    observed_returns: list = field(default_factory=list)    # z_t: Training targets for the value function
+
+    opened_actions: list = field(default_factory=list)      # Continuous Agents: Open actions Progressive Widening.
+
+    def capture(self, state: GameState, pi: np.ndarray, r: float, v: float,
+                action_space: typing.Optional[np.ndarray] = None) -> None:
         """Take a snapshot of the current state of the environment and the search results"""
         self.observations.append(state.observation)
         self.actions.append(state.action)
@@ -38,12 +95,19 @@ class GameHistory:
         self.rewards.append(r)
         self.search_returns.append(v)
 
+        if action_space is not None:
+            # Only store the action-support points in continuous settings. Infer for discrete space from probabilities.
+            self.opened_actions.append(action_space)
+
     def terminate(self) -> None:
         """Take a snapshot of the terminal state of the environment"""
         self.probabilities.append(np.zeros_like(self.probabilities[-1]))
         self.rewards.append(0)         # Reward past u_T
         self.search_returns.append(0)  # Bootstrap: Future possible reward = 0
         self.terminated = True
+
+        if self.opened_actions:
+            self.opened_actions.append(np.random.uniform(size=self.opened_actions[-1].shape))
 
     def refresh(self) -> None:
         """Clear all statistics within the class"""
@@ -73,7 +137,7 @@ class GameHistory:
 
     def stackObservations(self, length: int, current_observation: typing.Optional[np.ndarray] = None,
                           t: typing.Optional[int] = None) -> np.ndarray:  # TODO: rework function.
-        """Stack the most recent 'length' elements from the observation list along the end of the observation axis"""
+        """ Stack the most recent 'length' elements from the observation list along the end of the observation axis """
         if length <= 1:
             if current_observation is not None:
                 return current_observation
@@ -105,24 +169,6 @@ class GameHistory:
             trajectory = prefix + trajectory
 
         return np.concatenate(trajectory, axis=-1)  # Concatenate along channel dimension.
-
-    @staticmethod
-    def print_statistics(histories: typing.List[typing.List[GameHistory]]) -> None:
-        """ Print generic statistics over a nested list of GameHistories (the entire Replay-Buffer). """
-        flat = GameHistory.flatten(histories)
-
-        n_self_play_iterations = len(histories)
-        n_episodes = len(flat)
-        n_samples = sum([len(x) for x in flat])
-
-        print("=== Replay Buffer Statistics ===")
-        print(f"Replay buffer filled with data from {n_self_play_iterations} self play iterations")
-        print(f"In total {n_episodes} episodes have been played amounting to {n_samples} data samples")
-
-    @staticmethod
-    def flatten(nested_histories: typing.List[typing.List[GameHistory]]) -> typing.List[GameHistory]:
-        """ Flatten doubly nested list to a normal list of objects. """
-        return [subitem for item in nested_histories for subitem in item]
 
 
 class MinMaxStats(object):
