@@ -152,9 +152,13 @@ class HierarchicalGameHistory(IGameHistory):
             horizon = np.min([t + n, len(self.summed_rewards) - 1])
 
             # TODO: Penalize during subgoal testing. Also set discount to 0 ?
-            discounted_rewards = [np.power(gamma, k - t) * (self.summed_rewards[k] if not self.penalize[k] else -200)
-                                  for k in range(t, horizon)]
-            bootstrap = (np.power(gamma, horizon - t) * search_returns[horizon]) if horizon <= t + n else 0
+            if sum(self.penalize[t:horizon]):
+                horizon = t + np.argmax(self.penalize[t:horizon])   # Goal-episode termination.
+                bootstrap = -200 * np.power(gamma, horizon - t)     # -200 = penalty
+            else:
+                bootstrap = (np.power(gamma, horizon - t) * search_returns[horizon]) if horizon <= t + n else 0
+
+            discounted_rewards = [np.power(gamma, k - t) * self.summed_rewards[k] for k in range(t, horizon)]
 
             self.muzero_returns.append(sum(discounted_rewards) + bootstrap)
 
@@ -189,6 +193,8 @@ def get_muzero_goal_samples(reference, histories: typing.List[HierarchicalGameHi
     def sample(h_i, i, w):
         # TODO: Adjust i coordinate for original goal-sampled timepoint. CHECK IF CORRECT!
         i = histories[h_i].goal_indices.index(histories[h_i].goals[i].atomic_index)
+
+        k_trunc = np.argmax(histories[h_i].penalize[i:i+k]) if sum(histories[h_i].penalize[i:i+k]) else k  # TODO
 
         # Hindsight action transitions for goal relabelling
         indices = histories[h_i].goal_indices[i:i+k]
