@@ -9,7 +9,7 @@ import numpy as np
 
 from utils.game_utils import GameState
 from utils.selfplay_utils import GameHistory
-from utils.HierarchicalUtils import GoalState
+from utils.HierarchicalUtils import GoalState, goal_achieved
 from utils import DotDict
 
 from AlphaZero.implementations.DefaultAlphaZero import DefaultAlphaZero
@@ -193,7 +193,7 @@ class HierarchicalMuZeroPlayer(Player):
             self.model = TwoLevelNetworkHierarchy(self.game, self.args.net_args, self.args.architecture)
             self.search_engine = PolicyHierarchy(self.game, self.model, self.args.args)
             self.name = self.args.name
-            self.goal = GoalState(None, 0, True, 0)
+            self.goal = GoalState.empty(None)
 
     def set_variables(self, model, search_engine, name: str) -> None:
         """ Assign Neural Network and Search class to an external reference """
@@ -201,20 +201,23 @@ class HierarchicalMuZeroPlayer(Player):
         self.search_engine = search_engine
         self.name = name
         self.args = self.search_engine.args
-        self.goal = GoalState(None, 0, True, 0)
+        self.goal = GoalState.empty(None)
 
     def update_goal(self, current_state: GameState, goal: GoalState) -> GoalState:
         if goal.goal is None:
             return goal
 
         goal.age += 1
-        goal.achieved = self.search_engine.goal_achieved(current_state.observation, goal.goal)
+        norm = lambda x: x - self.game.obs_low / (self.game.obs_high - self.game.obs_low)
+        goal.achieved = goal_achieved(
+            norm(current_state.observation.ravel()), norm(goal.goal.ravel()), self.args.goal_error)
         return goal
 
     def act(self, state: GameState) -> int:
 
         goal = self.update_goal(state, self.goal)
         if goal.achieved or goal.age >= self.args.goal_horizon:
+            # print("update goal during pitting")  # debugging line
             self.goal, _ = self.search_engine.sample_goal(state, self.history, 0)
         a, _ = self.search_engine.sample_action(state, self.history, self.goal, 0.0)
 

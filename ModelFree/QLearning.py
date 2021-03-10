@@ -30,7 +30,7 @@ class UDQN(IUVFA):
             raise NotImplementedError(f"Optimization method {self.net_args.optimizer.method} not implemented...")
 
         # Set default goal to zeros ==> defaults to no goal/ the canonical algorithm.
-        self.set_goal(GoalState(np.zeros(get_goal_space(net_args, game)), 0, False, 0))
+        self.set_goal(GoalState.empty(np.zeros(get_goal_space(net_args, game))))
 
     def sample(self, observation: np.ndarray, epsilon: float = 0.01, **kwargs) -> float:
         action_bins = self.network.model.predict([observation[np.newaxis, ...],
@@ -68,7 +68,7 @@ class UDQN(IUVFA):
             for (a, b) in zip(self.network.target.weights, self.network.model.weights):
                 a.assign(b)
 
-        self.monitor.log(loss, 'loss')
+        self.monitor.log(loss, 'DQN_loss')
         self.steps += 1
 
     @tf.function
@@ -122,7 +122,7 @@ class UDDPG(IUVFA):
             raise NotImplementedError(f"Optimization method {self.net_args.optimizer.method} not implemented...")
 
         # Set default goal to zeros ==> defaults to no goal/ the canonical algorithm.
-        self.set_goal(np.zeros(self.network.get_goal_space(net_args)))
+        self.set_goal(GoalState.empty(np.zeros(self.network.get_goal_space(net_args))))
 
     def sample(self, observation: np.ndarray, epsilon: float = 1.0, **kwargs) -> np.ndarray:
         # Inference
@@ -170,10 +170,10 @@ class UDDPG(IUVFA):
             self._update_target(self.network.critic_target_a.variables, self.network.critic_a.variables, polyak)
             self._update_target(self.network.critic_target_a.variables, self.network.critic_b.variables, polyak)
 
-            self.monitor.log(loss_actor, 'loss_actor')
+            self.monitor.log(loss_actor, 'DDPG_loss_actor')
 
-        self.monitor.log(loss_critic_a, 'loss_critic_a')
-        self.monitor.log(loss_critic_b, 'loss_critic_b')
+        self.monitor.log(loss_critic_a, 'DDPG_loss_critic_a')
+        self.monitor.log(loss_critic_b, 'DDPG_loss_critic_b')
         self.steps += 1
 
     @tf.function

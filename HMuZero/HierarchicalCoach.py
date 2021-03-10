@@ -20,7 +20,7 @@ from utils.game_utils import GameState
 from utils.selfplay_utils import sample_batch
 from utils.selfplay_utils import ParameterScheduler
 from utils.HierarchicalUtils import GoalState, HierarchicalGameHistory, get_goal_samples, get_muzero_goal_samples, \
-    get_action_samples, get_muzero_action_samples
+    get_action_samples, get_muzero_action_samples, goal_achieved
 from utils import debugging
 
 
@@ -64,6 +64,13 @@ class HierarchicalCoach(CoachBase):
 
         self.temp_by_weights = self.temp_schedule.args.by_weight_update
 
+    def update_parameters(self, training_data: typing.List[HierarchicalGameHistory]) -> None:
+        """ Add functionality for logging latest episode's goal statistics before backpropagation. """
+        self.neural_net.monitor.log_goal_statistics(training_data[-self.args.num_episodes:])
+
+        # backpropagation
+        super().update_parameters(training_data)
+
     def sampleBatch(self, histories: typing.List[HierarchicalGameHistory]) -> typing.List:
         sample_coordinates, sample_weight = sample_batch(histories, n=self.neural_net.net_args.batch_size,
                                                          prioritize=False)
@@ -73,14 +80,7 @@ class HierarchicalCoach(CoachBase):
 
         goal_samples = f_goal(self, histories, sample_coordinates, sample_weight)
         action_samples = f_action(self, histories, sample_coordinates, sample_weight)
-        #
-        # print('goal')
-        # for s in goal_samples:
-        #     print(s)
-        #
-        # print('action')
-        # for s in action_samples:
-        #     print(s)
+
         return [goal_samples, action_samples]
 
     def update_goal(self, current_state: GameState, goal: GoalState) -> GoalState:
@@ -88,9 +88,12 @@ class HierarchicalCoach(CoachBase):
             return goal
 
         goal.age += 1
-        goal.achieved = self.search_engine.goal_achieved(current_state.observation, goal.goal)
 
-        return GoalState(goal.goal, goal.age, goal.achieved, goal.atomic_index)
+        norm = lambda x: x - self.game.obs_low / (self.game.obs_high - self.game.obs_low)
+        goal.achieved = goal_achieved(
+            norm(current_state.observation.ravel()), norm(goal.goal.ravel()), self.args.goal_error)
+
+        return goal
 
     def executeEpisode(self) -> HierarchicalGameHistory:
         """
@@ -111,7 +114,7 @@ class HierarchicalCoach(CoachBase):
         step = 0
 
         # Dummy goal to be updated at the first episode step.
-        goal, goal_inference_statistics = GoalState(None, np.inf, True, step), None
+        goal, goal_inference_statistics = GoalState.empty(None), None
 
         while not state.done and step < self.args.max_episode_moves:
             if debugging.RENDER:  # Display visualization of the environment if specified.
@@ -124,6 +127,7 @@ class HierarchicalCoach(CoachBase):
             # Inference as a joint policy.
             goal = self.update_goal(state, goal)
             if goal.achieved or goal.age >= self.args.goal_horizon:
+                goal.end_state = state.observation
                 goal, goal_inference_statistics = self.search_engine.sample_goal(state, history, temp_g)
             state.action, action_inference_statistics = self.search_engine.sample_action(state, history, goal, temp_a)
 

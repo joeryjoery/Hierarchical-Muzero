@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from abc import ABC
 import typing
 
 import numpy as np
@@ -9,17 +8,33 @@ from utils.game_utils import GameState
 from utils.selfplay_utils import IGameHistory
 
 
+# def cosine_distance(a, b):
+#     return 1 - a.ravel() @ b.ravel() / (np.linalg.norm(a) * np.linalg.norm(b))
+
+
+def normed_euclidean_distance(a, b):
+    return np.linalg.norm(a - b)
+
+
+def goal_achieved(current_state: np.ndarray, current_goal: np.ndarray, goal_error: float) -> bool:
+    """ """
+    # TODO: args options for distance based or binary rewards. --> integrate function return as reward value.
+    return normed_euclidean_distance(current_state, current_goal) <= goal_error
+
+
 @dataclass
 class GoalState:
     goal: np.ndarray   # Current goal value.
     age: int           # Number of time-steps this goal has been tracked through the environment.
     achieved: bool     # Whether this goal has been achieved at the current time-step.
     atomic_index: int  # True time-measure within the current environment episode.
+    start_state: np.ndarray
+    end_state: np.ndarray = None
     subgoal_testing: bool = False
 
     @staticmethod
     def empty(array: np.ndarray):
-        return GoalState(array, 0, False, 0)
+        return GoalState(array, 0, True, 0, None)
 
 
 @dataclass
@@ -45,6 +60,7 @@ class HierarchicalGameHistory(IGameHistory):
     atomic_rewards: list = field(default_factory=list)          # u_t+1: Observed env. reward after performing a_t+1
     high_level_goals: list = field(default_factory=list)
     goals: list = field(default_factory=list)                   # g_t: Goal set by hierarchy at s_t.
+    penalize: list = field(default_factory=list)
     goal_inference_stats: list = field(default_factory=list)    # List of either ModelFreeStats or MCTSStats
     action_inference_stats: list = field(default_factory=list)  # List of either ModelFreeStats or MCTSStats
 
@@ -81,6 +97,12 @@ class HierarchicalGameHistory(IGameHistory):
             # Reward for higher level policy.
             if not self.sum_rewards:
                 self.summed_rewards.append(-1)
+                if len(self.goal_indices) > 1:
+                    if self.goals[-2].subgoal_testing and not self.goals[-2].achieved:
+                        self.penalize.append(True)
+                    else:
+                        self.penalize.append(False)
+
             elif len(self.goal_indices) > 1:  # Sum up rewards of the terminated/ previous goal.
                 # TODO: Check proper array length?
                 self.summed_rewards.append(np.sum(self.atomic_rewards[self.goal_indices[-2]:self.goal_indices[-1]]))
@@ -89,11 +111,19 @@ class HierarchicalGameHistory(IGameHistory):
         self.atomic_rewards.append(0)
         self.terminated = True
 
+        # Update goal statistics
+        self.goals[-1].age += 1
+        self.goals[-1].end_state = self.next_observations[-1]
+        self.goals[-1].achieved = False  # Set to false due to potential (unfair) truncation. TODO: check if necessary.
+
         # Terminate reward for higher level policy.
         if self.sum_rewards:
             # TODO: Check proper array length?
             self.summed_rewards.append(np.sum(self.atomic_rewards[self.goal_indices[-1]:]))  # Last goal reward
-        self.summed_rewards.append(0)  # Terminated reward
+        self.summed_rewards.append(0)
+
+        # Don't penalize on last goal as it may be truncated due to episode termination. TODO: Check if necessary
+        self.penalize += [False] * 2  # last reward + termination reward.
 
         # truncate goal inference and action inference
         if len(self.goal_inference_stats[-1]):
@@ -121,13 +151,15 @@ class HierarchicalGameHistory(IGameHistory):
         for t in range(len(self.summed_rewards)):
             horizon = np.min([t + n, len(self.summed_rewards) - 1])
 
-            discounted_rewards = [np.power(gamma, k - t) * self.summed_rewards[k] for k in range(t, horizon)]
+            # TODO: Penalize during subgoal testing. Also set discount to 0 ?
+            discounted_rewards = [np.power(gamma, k - t) * (self.summed_rewards[k] if not self.penalize[k] else -200)
+                                  for k in range(t, horizon)]
             bootstrap = (np.power(gamma, horizon - t) * search_returns[horizon]) if horizon <= t + n else 0
 
             self.muzero_returns.append(sum(discounted_rewards) + bootstrap)
 
     def stackObservations(self, length: int, current_observation: typing.Optional[np.ndarray] = None,
-                          t: typing.Optional[int] = None) -> np.ndarray:  # TODO: rework function.
+                          t: typing.Optional[int] = None) -> np.ndarray:
         """ Stack the most recent 'length' elements from the observation list along the end of the observation axis """
         if length <= 1:
             if current_observation is not None:
@@ -151,14 +183,18 @@ def get_muzero_goal_samples(reference, histories: typing.List[HierarchicalGameHi
                             sample_coordinates: typing.List[typing.Tuple[int, int]],
                             sample_weight: typing.List[float]) -> typing.List:
     k = reference.args.K
+    norm = lambda x: (x - reference.game.obs_low) / (reference.game.obs_high - reference.game.obs_low)
+    unnorm = lambda x: x * (reference.game.obs_high - reference.game.obs_low) + reference.game.obs_low
 
     def sample(h_i, i, w):
-        # TODO: Adjust i coordinate for original goal-sampled timepoint.
+        # TODO: Adjust i coordinate for original goal-sampled timepoint. CHECK IF CORRECT!
         i = histories[h_i].goal_indices.index(histories[h_i].goals[i].atomic_index)
 
         # Hindsight action transitions for goal relabelling
         indices = histories[h_i].goal_indices[i:i+k]
-        actions = [histories[h_i].next_observations[j].ravel() for j in indices]
+        actions = [norm(histories[h_i].goals[j].end_state.ravel()) if not histories[h_i].goals[j].subgoal_testing
+                   else norm(histories[h_i].goals[j].goal.ravel()) for j in indices]
+
         a_truncation = k - len(actions)
         if a_truncation > 0:  # Uniform policy when unrolling beyond terminal states.
             actions += [np.random.uniform(size=actions[-1].shape) for _ in range(a_truncation)]
@@ -167,6 +203,8 @@ def get_muzero_goal_samples(reference, histories: typing.List[HierarchicalGameHi
         action_support, pis, _ = list(zip(*inference))
 
         action_support, pis = list(action_support), list(pis)
+
+        # TODO: Concatenate actions (hindsight or goals) into the action_support and probability vectors (pi).
 
         rewards = histories[h_i].summed_rewards[i:i+k+1]
         vs = histories[h_i].muzero_returns[i:i+k+1]
@@ -215,17 +253,15 @@ def get_action_samples(reference, histories: typing.List[HierarchicalGameHistory
     def sample(h_i, i):
         # Sample 50/50 HER or regular transition.
         if np.random.random() > 0.5:  # Regular transition.
-            goal_achieved = reference.search_engine.goal_achieved(
-                histories[h_i].observations[i], histories[h_i].goals[i].goal)
-
+            achieved = histories[h_i].goals[i].achieved
             return (
                 histories[h_i].observations[i],       # state
                 histories[h_i].goals[i].goal,         # goal
                 histories[h_i].actions[i],            # actions
-                -int(not goal_achieved),              # binary reward based on goal achieved (shortest path).
+                -int(not achieved),                   # binary reward based on goal achieved (shortest path).
                 histories[h_i].next_observations[i],  # next state
                 histories[h_i].goals[i].goal,         # next goal = current goal. New goals are seen as terminal states.
-                int(goal_achieved),                   # done if last observation in current goal-episode.
+                int(achieved),                        # done if last observation in current goal-episode.
             )
         else:  # HER goal transition using the HAC trick (Levy et al., 2019)
             goal_episode = histories[h_i].goals[i:i+reference.args.goal_horizon+1]

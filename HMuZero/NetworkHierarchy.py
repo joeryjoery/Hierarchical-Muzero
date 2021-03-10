@@ -46,6 +46,7 @@ class TwoLevelNetworkHierarchy:
 
         self.goal_net.train(goal_examples)
         self.action_net.train(act_examples)
+
         self.steps += 1
 
     def save_checkpoint(self, folder: str = 'checkpoint', filename: str = 'checkpoint.pth.tar') -> None:

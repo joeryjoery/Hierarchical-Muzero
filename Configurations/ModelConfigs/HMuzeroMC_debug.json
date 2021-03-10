@@ -7,8 +7,8 @@
 
   "args": {
     "num_selfplay_iterations": 500,
-    "num_episodes": 20,
-    "num_gradient_steps": 40,
+    "num_episodes": 2,
+    "num_gradient_steps": 4,
     "max_episode_moves": 500,
     "max_trial_moves": 500,
     "pitting": true,
@@ -26,7 +26,7 @@
     "plan_goals": true,
     "goal_error": 0.01,
     "goal_horizon": 5,
-    "subgoal_testing": 0.3,
+    "subgoal_testing": 0.0,
     "K": 3,
     "n_steps": 10,
     "c_pw": 1,
@@ -38,9 +38,9 @@
     "minimum_reward": null,
     "maximum_reward": null,
 
-    "checkpoint": "./out/hierarchical/mc_out/",
+    "checkpoint": "./out/hierarchical/pendulum/",
     "load_model": false,
-    "load_folder_file": ["./out/hierarchical/mc_out/", "latest.pth.tar"],
+    "load_folder_file": ["./out/hierarchical/pendulum/", "latest.pth.tar"],
     "selfplay_buffer_window": 10,
 
     "temperature_schedule": {
@@ -65,7 +65,7 @@
     "dropout": 0.0,
     "gamma": 0.95,
     "target_frequency": 5,
-    "batch_size": 128,
+    "batch_size": 5,
     "latent_depth": 8,
     "num_channels": 256,
     "num_towers": 3,

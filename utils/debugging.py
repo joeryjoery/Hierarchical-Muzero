@@ -304,11 +304,53 @@ class AlphaZeroMonitor(Monitor):
 
 class HierarchicalMuZeroMonitor(Monitor):
 
+    def log_goal_statistics(self, training_data: typing.List) -> None:
+
+        goal_success = list()
+        goal_length = list()
+        distances = list()
+        for episode in training_data:
+            len_episode = len(episode)
+            num_goals = len(episode.goals)
+
+            lengths = np.asarray(episode.goal_indices + [len_episode])[1:] - np.asarray(episode.goal_indices)
+
+            achieved = [int(episode.goals[i - 1].achieved) for i in episode.goal_indices[1:] + [0]
+                        if episode.goals[i - 1].subgoal_testing]  # [0] -> [-1]
+            distance = [np.linalg.norm(episode.goals[i - 1].goal - episode.next_observations[i - 1])
+                        for i in episode.goal_indices[1:] + [0]]  # [0] -> [-1]
+
+            success_ratio = np.sum(achieved) / len(achieved)
+
+            distances.append(np.mean(distance))
+            goal_success.append(success_ratio)
+            goal_length.append(np.mean(lengths))
+
+            # print(success_ratio, lengths, np.mean(lengths), achieved, distance)  # DEBUGGING
+
+        self.log(np.mean(distances), 'avg_goal_separation')
+        self.log(np.mean(goal_success), 'avg_goal_success')
+        self.log(np.mean(goal_length), 'avg_goal_length')
+
+        self.log_distribution(distances, 'goal_separation')
+        self.log_distribution(np.asarray(goal_success), 'goal_success')
+        self.log_distribution(np.asarray(goal_length), 'goal_length')
+
+        if DEBUG_MODE:
+            pass  # Log additional statistics. TODO
+
     def log_batch(self, data_batch: typing.List) -> None:
-        pass
+        goal_examples, act_examples = data_batch
+
+        # Network specific logging.
+        self.reference.goal_net.monitor.log_batch(goal_examples)
+        self.reference.action_net.monitor.log_batch(act_examples)
+
+        # Joint policy logging.
+        # TODO
 
 
 class ModelFreeMonitor(Monitor):
 
     def log_batch(self, data_batch: typing.List) -> None:
-        pass
+        pass  # TODO
