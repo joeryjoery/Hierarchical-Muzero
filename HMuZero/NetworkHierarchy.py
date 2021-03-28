@@ -51,25 +51,14 @@ class TwoLevelNetworkHierarchy:
 
     def save_checkpoint(self, folder: str = 'checkpoint', filename: str = 'checkpoint.pth.tar') -> None:
         """
-        Saves the current neural network (with its parameters) in folder/filename
-        Each individual part of the MuZero algorithm is stored separately (representation, dynamics, prediction
-        and optionally the latent state decoder).
-
-        If specified folder does not yet exists, the method creates a new folder if permitted.
-
-        :param folder: str Path to model weight files
-        :param filename: str Base name for model weight files
+        Wrapper function to call each network's save-function
         """
         self.action_net.save_checkpoint(folder, f'action_{filename}')
         self.goal_net.save_checkpoint(folder, f'goal_{filename}')
 
     def load_checkpoint(self, folder: str = 'checkpoint', filename: str = 'checkpoint.pth.tar') -> None:
         """
-        Loads parameters of each neural network model from given folder/filename
-
-        :param folder: str Path to model weight files
-        :param filename: str Base name of model weight files
-        :raises: FileNotFoundError if one of the three implementations are missing or if path is incorrectly specified.
+        Wrapper function to call each network's load-function
         """
         self.action_net.load_checkpoint(folder, f'action_{filename}')
         self.goal_net.load_checkpoint(folder, f'goal_{filename}')

@@ -1,4 +1,5 @@
 import typing
+import os
 
 import numpy as np
 import tensorflow as tf
@@ -17,7 +18,7 @@ class UDQN(IUVFA):
         if goal_sampling:
             raise NotImplementedError("Discrete goal sampling specified through DQN architecture...")
 
-        self.loss_function = tf.keras.losses.Huber()
+        self.loss_function = tf.keras.losses.MeanSquaredError()
         assert hasattr(self.network, 'model') and hasattr(self.network, 'target'), "Incorrect network specification."
 
         # Select parameter optimizer from config.
@@ -35,7 +36,6 @@ class UDQN(IUVFA):
     def sample(self, observation: np.ndarray, epsilon: float = 0.01, **kwargs) -> float:
         action_bins = self.network.model.predict([observation[np.newaxis, ...],
                                                   self.current_goal.goal[np.newaxis, ...]])[0]
-
         if np.random.rand() < epsilon:
             return np.random.randint(action_bins.shape[-1])
         else:
@@ -60,6 +60,8 @@ class UDQN(IUVFA):
         bootstrap = q_target[np.arange(len(target_actions)), target_actions]
 
         y = rewards + self.net_args.gamma * (1 - done) * bootstrap
+        y = np.clip(y, -self.net_args.actor_bound, 0)
+        print(rewards, y)
         loss = self._update_model(cast_to_tensor(states), cast_to_tensor(goals), cast_to_tensor(action_ohe),
                                   cast_to_tensor(y))
 
@@ -82,15 +84,48 @@ class UDQN(IUVFA):
             loss += l2 * self.net_args.l2
 
         grads = tape.gradient(loss, self.network.model.weights)
+        grads = [tf.clip_by_norm(g, self.net_args.norm_clip) for g in grads]
         self.optimizer.apply_gradients(zip(grads, self.network.model.weights))
 
         return loss
 
     def save_checkpoint(self, folder: str = 'checkpoint', filename: str = 'checkpoint.pth.tar') -> None:
-        pass
+        """
+        Saves the current neural network (with its parameters) in folder/filename
+        If specified folder does not yet exists, the method creates a new folder if permitted.
+
+        :param folder: str Path to model weight files
+        :param filename: str Base name for model weight files
+        """
+        model_path = os.path.join(folder, 'dqn_' + filename)
+        target_path = os.path.join(folder, 'dqncopy_' + filename)
+        if not os.path.exists(folder):
+            print(f"Checkpoint Directory does not exist! Making directory {folder}")
+            os.mkdir(folder)
+        else:
+            print("Checkpoint Directory exists! ")
+        self.network.model.save_weights(model_path)
+        self.network.target.save_weights(target_path)
+
 
     def load_checkpoint(self, folder: str = 'checkpoint', filename: str = 'checkpoint.pth.tar') -> None:
-        pass
+        """
+        Loads parameters of each neural network model from given folder/filename
+
+        :param folder: str Path to model weight files
+        :param filename: str Base name of model weight files
+        :raises: FileNotFoundError if one of the three implementations are missing or if path is incorrectly specified.
+        """
+        model_path = os.path.join(folder, 'dqn_' + filename)
+        target_path = os.path.join(folder, 'dqncopy_' + filename)
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"No DQN Model in path {model_path}")
+        if not os.path.exists(target_path):
+            raise FileNotFoundError(f"No DQN Target Model in path {target_path}")
+
+        self.network.model.load_weights(model_path)
+        self.network.target.load_weights(target_path)
 
 
 class UDDPG(IUVFA):

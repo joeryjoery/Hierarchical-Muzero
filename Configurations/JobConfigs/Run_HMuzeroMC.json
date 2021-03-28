@@ -1,0 +1,25 @@
+{
+  "name": "MC_HMuZero",
+  "experiment": "TOURNEY",
+  "output_dir": "hierarchical/mc_out_corrected_testing/",
+
+  "num_repeat": 1,
+  "num_trials": 10,
+  "checkpoint_resolution": 1,
+  "num_opponents": null,
+  "return_data": true,
+
+  "environment": {
+    "name": "GYM",
+    "args": {
+      "env_name": "MountainCar-v0"
+    }
+  },
+
+  "players": [
+    {
+      "name": "GOAL_MUZERO",
+      "config": "out/hierarchical/mc_out_corrected_testing/Hierarchical_Base_Hierarchical_Gym_gym_MountainCar-v0_20210315-185715.json"
+    }
+  ]
+}

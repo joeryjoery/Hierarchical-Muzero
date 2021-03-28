@@ -19,8 +19,8 @@ from utils import DotDict
 from utils.game_utils import GameState
 from utils.selfplay_utils import sample_batch
 from utils.selfplay_utils import ParameterScheduler
-from utils.HierarchicalUtils import GoalState, HierarchicalGameHistory, get_goal_samples, get_muzero_goal_samples, \
-    get_action_samples, get_muzero_action_samples, goal_achieved
+from utils.HierarchicalUtils import GoalState, HierarchicalGameHistory, get_muzero_goal_samples, \
+    get_action_samples, goal_achieved
 from utils import debugging
 
 
@@ -59,10 +59,14 @@ class HierarchicalCoach(CoachBase):
 
         # TODO: Create exploration/ parameter schedules for agents.
         # Initialize MCTS visit count exponentiation factor schedule.
-        self.temp_schedule = ParameterScheduler(self.args.temperature_schedule)
-        self.update_temperature = self.temp_schedule.build()
+        self.goal_explore_schedule = ParameterScheduler(self.args.goal_explore_schedule)
+        self.action_explore_schedule = ParameterScheduler(self.args.action_explore_schedule)
 
-        self.temp_by_weights = self.temp_schedule.args.by_weight_update
+        self.update_goal_exploration = self.goal_explore_schedule.build()
+        self.update_action_exploration = self.action_explore_schedule.build()
+
+        self.explore_goal_by_weights = self.goal_explore_schedule.args.by_weight_update
+        self.explore_action_by_weights = self.action_explore_schedule.args.by_weight_update
 
     def update_parameters(self, training_data: typing.List[HierarchicalGameHistory]) -> None:
         """ Add functionality for logging latest episode's goal statistics before backpropagation. """
@@ -75,8 +79,8 @@ class HierarchicalCoach(CoachBase):
         sample_coordinates, sample_weight = sample_batch(histories, n=self.neural_net.net_args.batch_size,
                                                          prioritize=False)
 
-        f_goal = get_muzero_goal_samples if self.args.plan_goals else get_goal_samples
-        f_action = get_muzero_action_samples if self.args.plan_actions else get_action_samples
+        f_goal = get_muzero_goal_samples
+        f_action = get_action_samples
 
         goal_samples = f_goal(self, histories, sample_coordinates, sample_weight)
         action_samples = f_action(self, histories, sample_coordinates, sample_weight)
@@ -121,15 +125,18 @@ class HierarchicalCoach(CoachBase):
                 self.game.render(state)
 
             # Update MCTS visit count temperature according to an episode or weight update schedule.
-            temp_g = self.update_temperature(self.neural_net.goal_net.steps if self.temp_by_weights else step)
-            temp_a = self.update_temperature(self.neural_net.action_net.steps if self.temp_by_weights else step)
+            eps_g = self.update_goal_exploration(self.neural_net.goal_net.steps
+                                                 if self.explore_goal_by_weights else step)
+            eps_a = self.update_action_exploration(self.neural_net.action_net.steps
+                                                   if self.explore_action_by_weights else step)
 
             # Inference as a joint policy.
             goal = self.update_goal(state, goal)
             if goal.achieved or goal.age >= self.args.goal_horizon:
-                goal.end_state = state.observation
-                goal, goal_inference_statistics = self.search_engine.sample_goal(state, history, temp_g)
-            state.action, action_inference_statistics = self.search_engine.sample_action(state, history, goal, temp_a)
+                goal.end_state = np.copy(state.observation)
+                goal, goal_inference_statistics = self.search_engine.sample_goal(state, history, eps_g)
+
+            state.action, action_inference_statistics = self.search_engine.sample_action(state, history, goal, eps_a)
 
             # Environment transition and store observations.
             next_state, r = self.game.getNextState(state, state.action)
@@ -142,7 +149,13 @@ class HierarchicalCoach(CoachBase):
 
         # Cleanup environment and GameHistory
         self.game.close(state)
-        history.terminate()
+
+        # Update goal object by reference upon termination.
+        goal = self.update_goal(state, goal)
+        goal.end_state = np.copy(state.observation)
+
+        # Terminate history and compute returns.
+        history.terminate(self)
         history.compute_returns(self.args.gamma, self.args.n_steps)
 
         return history

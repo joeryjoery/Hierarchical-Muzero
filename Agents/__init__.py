@@ -53,6 +53,7 @@ Players = {
     "ALPHAZERO": DefaultAlphaZeroPlayer,
     "MUZERO": DefaultMuZeroPlayer,
     "BLIND_MUZERO": BlindMuZeroPlayer,
+    "GOAL_MUZERO": HierarchicalMuZeroPlayer,
     "RANDOM": RandomPlayer,
     "DETERMINISTIC": DeterministicPlayer,
     "MANUAL": ManualPlayer

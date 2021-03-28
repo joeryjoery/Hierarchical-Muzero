@@ -93,6 +93,7 @@ class ContinuousMuZero(MuZeroContinuousNeuralNet):
             loss, step_losses = self.loss_function(*data)
 
         grads = tape.gradient(loss, self.get_variables())
+        grads = [clip_by_norm(g, self.net_args.norm_clip) for g in grads]
         self.optimizer.apply_gradients(zip(grads, self.get_variables()), name=f'MuZeroContinuous_{self.architecture}')
 
         # Logging

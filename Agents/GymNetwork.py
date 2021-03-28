@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 
-from keras.layers import Dense, Input, Reshape, Concatenate, Activation, Softmax
+from keras.layers import Dense, Input, Reshape, Concatenate, Activation, Softmax, Lambda
 from keras.models import Model
 from keras.optimizers import Adam
 
@@ -276,6 +276,9 @@ class DQNGymNetwork:
         fc_sequence = self.crafter.dense_sequence(self.args.actor_size, concat)
 
         qs = Dense(self.action_size, activation='linear', name='q')(fc_sequence)
+
+        # Scale to [-horizon, 0]. Input to sigmoid is shifted for an optimistic initialiation (near 0)
+        qs = Lambda(lambda x: Activation('sigmoid')(x - self.args.actor_bound) * -self.args.actor_bound)(qs)
 
         return qs
 

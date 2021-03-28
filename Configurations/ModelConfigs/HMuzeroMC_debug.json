@@ -24,9 +24,11 @@
     "latent_decoder": false,
     "plan_actions": false,
     "plan_goals": true,
-    "goal_error": 0.01,
+    "goal_error": 0.05,
     "goal_horizon": 5,
-    "subgoal_testing": 0.0,
+    "subgoal_testing": 0.3,
+    "subgoal_sampling": 0.5,
+    "subgoal_penalty": -30,
     "K": 3,
     "n_steps": 10,
     "c_pw": 1,
@@ -43,10 +45,15 @@
     "load_folder_file": ["./out/hierarchical/pendulum/", "latest.pth.tar"],
     "selfplay_buffer_window": 10,
 
-    "temperature_schedule": {
+    "goal_explore_schedule": {
       "method": "stepwise",
       "by_weight_update": true,
       "schedule_points": [[0, 1]]
+    },
+    "action_explore_schedule": {
+      "method": "linear",
+      "by_weight_update": true,
+      "schedule_points": [[0, 0.2], [5000, 0.1], [15000, 0.05]]
     }
   },
 
@@ -62,6 +69,7 @@
     "l2": 1e-4,
     "dynamics_penalty": 0.0,
     "entropy_penalty": 0.1,
+    "norm_clip": 10,
     "dropout": 0.0,
     "gamma": 0.95,
     "target_frequency": 5,
@@ -70,6 +78,7 @@
     "num_channels": 256,
     "num_towers": 3,
     "num_dense": 2,
+    "actor_bound": 5,
     "actor_size": 2,
     "size_dense": 32,
     "activation": "elu",

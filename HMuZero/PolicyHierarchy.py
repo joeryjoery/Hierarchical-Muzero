@@ -41,12 +41,12 @@ class PolicyHierarchy(SearchBase):
         if self.goal_engine is not None:
             actions, pi, v = self.goal_engine.runMCTS(state, trajectory, temp)
             g = actions[np.random.choice(len(actions), p=pi)]
-            goal = GoalState(self.goal_scaler(g), 0, False, len(trajectory), state.observation)  # TODO
+            goal = GoalState(self.goal_scaler(g), 0, False, len(trajectory), np.copy(state.observation))  # TODO
             inference_statistics = (actions, pi, v)
         else:
             # Simply sample a goal
             action = self.neural_net.goal_net.sample(state.observation)
-            goal = GoalState(action, 0, False, len(trajectory), state.observation)
+            goal = GoalState(action, 0, False, len(trajectory), np.copy(state.observation))
             inference_statistics = ()
 
         # cast to channel

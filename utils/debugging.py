@@ -320,7 +320,7 @@ class HierarchicalMuZeroMonitor(Monitor):
             distance = [np.linalg.norm(episode.goals[i - 1].goal - episode.next_observations[i - 1])
                         for i in episode.goal_indices[1:] + [0]]  # [0] -> [-1]
 
-            success_ratio = np.sum(achieved) / len(achieved)
+            success_ratio = np.sum(achieved) / len(achieved) if len(achieved) else 0
 
             distances.append(np.mean(distance))
             goal_success.append(success_ratio)

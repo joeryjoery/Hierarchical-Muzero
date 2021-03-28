@@ -9,7 +9,7 @@ import numpy as np
 
 from utils.game_utils import GameState
 from utils.selfplay_utils import GameHistory
-from utils.HierarchicalUtils import GoalState, goal_achieved
+from utils.HierarchicalUtils import GoalState, goal_achieved, HierarchicalGameHistory
 from utils import DotDict
 
 from AlphaZero.implementations.DefaultAlphaZero import DefaultAlphaZero
@@ -19,6 +19,7 @@ from MuZero.implementations.BlindMuZero import BlindMuZero
 from MuZero.MuMCTS import MuZeroMCTS
 from HMuZero.PolicyHierarchy import PolicyHierarchy
 from HMuZero.NetworkHierarchy import TwoLevelNetworkHierarchy
+from HMuZero.implementations.GoalConditionedMuZero import GCDefaultMuZero, GCContinuousMuZero
 from ModelFree.EmptyModel import NullModel
 from ModelFree.QLearning import UDQN, UDDPG
 
@@ -186,22 +187,51 @@ class HierarchicalMuZeroPlayer(Player):
 
     def __init__(self, game, arg_file: typing.Optional[str] = None, name: str = "") -> None:
         super().__init__(game, arg_file, name, parametric=True)
+        self.history = HierarchicalGameHistory()
         if self.player_args is not None:
             # Initialize MuZero by loading its parameter config and constructing the network and search classes.
             self.args = DotDict.from_json(self.player_args)
+            self.a_args = self.args.args
 
-            self.model = TwoLevelNetworkHierarchy(self.game, self.args.net_args, self.args.architecture)
-            self.search_engine = PolicyHierarchy(self.game, self.model, self.args.args)
+            # Define network/ policies for the higher (goal) and low (action) levels.
+            goal = GCContinuousMuZero if self.a_args.plan_goals else UDDPG
+            if game.continuous:
+                act = GCContinuousMuZero if self.a_args.plan_actions else UDDPG
+            else:
+                act = GCDefaultMuZero if self.a_args.plan_actions else UDQN
+
+            # Wrapper function for initializing the network/ policy hierarchy.
+            def builder(_g, _net_args):
+                return (goal(_g, _net_args, self.args.goal_architecture, goal_sampling=True),
+                        act(_g, _net_args, self.args.action_architecture))
+
+            self.model = TwoLevelNetworkHierarchy(self.game, self.args.net_args, builder)
+            self.search_engine = PolicyHierarchy(self.game, self.model, self.a_args)
             self.name = self.args.name
             self.goal = GoalState.empty(None)
+            self.g_inf = self.a_inf = None
 
     def set_variables(self, model, search_engine, name: str) -> None:
         """ Assign Neural Network and Search class to an external reference """
         self.model = model
         self.search_engine = search_engine
         self.name = name
-        self.args = self.search_engine.args
+        self.a_args = self.search_engine.args
         self.goal = GoalState.empty(None)
+        self.g_inf = self.a_inf = None
+
+    def refresh(self, hard_reset: bool = False) -> None:
+        """ Refresh or reinitialize memory/ observation trajectory of the agent. """
+        if hard_reset:
+            self.histories = list()
+            self.history.refresh()
+        else:
+            self.histories.append(self.history)
+            self.history = HierarchicalGameHistory()
+
+    def observe(self, state: GameState) -> None:
+        """ Capture an environment state observation within the agent's memory. """
+        self.history.capture(state, state, 0, self.goal, self.g_inf, self.a_inf)
 
     def update_goal(self, current_state: GameState, goal: GoalState) -> GoalState:
         if goal.goal is None:
@@ -210,16 +240,16 @@ class HierarchicalMuZeroPlayer(Player):
         goal.age += 1
         norm = lambda x: x - self.game.obs_low / (self.game.obs_high - self.game.obs_low)
         goal.achieved = goal_achieved(
-            norm(current_state.observation.ravel()), norm(goal.goal.ravel()), self.args.goal_error)
+            norm(current_state.observation.ravel()), norm(goal.goal.ravel()), self.a_args.goal_error)
         return goal
 
     def act(self, state: GameState) -> int:
 
         goal = self.update_goal(state, self.goal)
-        if goal.achieved or goal.age >= self.args.goal_horizon:
+        if goal.achieved or goal.age >= self.a_args.goal_horizon:
             # print("update goal during pitting")  # debugging line
-            self.goal, _ = self.search_engine.sample_goal(state, self.history, 0)
-        a, _ = self.search_engine.sample_action(state, self.history, self.goal, 0.0)
+            self.goal, self.g_inf = self.search_engine.sample_goal(state, self.history, 0)
+        a, self.a_inf = self.search_engine.sample_action(state, self.history, self.goal, 0.0)
 
         return a
 
