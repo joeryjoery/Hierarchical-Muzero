@@ -28,7 +28,7 @@ class GymGame(Game):
 
         self.dimensions = dummy.observation_space.shape
         if hasattr(dummy.action_space, 'n'):
-            self.actions = dummy.action_space.n
+            self.actions = dummy.action_space.n_tb
         else:
             self.actions = np.prod(dummy.action_space.shape).astype(int)
             self.wrappers += (lambda e: gym.wrappers.RescaleAction(e, 0, 1),)  # Normalize action-space to (0, 1)

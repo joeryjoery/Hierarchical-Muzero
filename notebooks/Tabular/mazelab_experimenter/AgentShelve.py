@@ -8,10 +8,18 @@ class AgentShelve:
     
     _IMPLEMENTED = {
         'TabularQLearner': agents.TabularQLearning,
+        'TabularQLearnerN': agents.TabularQLearningN,
+        'TabularQLambda': agents.TabularQLambda,
+        'TabularQET': agents.TabularQET,
         'TabularDynaQ': agents.TabularDynaQ,
         'MonteCarloQLearner': agents.MonteCarloQLearner, 
         'RandomAgent': agents.RandomAgent,
-        'HierQ': agents.HierQ
+        'HierQ': agents.HierQ,
+        'HierQV2': agents.HierQV2,
+        'HierQV2Indev': agents.HierQV2Indev,
+        'HierQTD': agents.HierQTD,
+        'HierQTS': agents.HierQTS,
+        'HierQET': agents.HierQET
     }
     
     @staticmethod

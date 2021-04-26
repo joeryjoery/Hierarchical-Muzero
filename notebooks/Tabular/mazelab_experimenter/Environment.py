@@ -1,6 +1,7 @@
 """ Modified from https://github.com/zuoxingdong/mazelab/blob/master/examples/navigation_env.ipynb """
 import typing
 import inspect
+from copy import deepcopy
 from collections import deque
 
 import numpy as np
@@ -57,12 +58,14 @@ class _Maze(BaseMaze):
 class _Env(BaseEnv):
     """ Wrapper for instantiating a MazeLab environment as an OpenAI Gym Environment. Modified from Zuo Xingdong's original code. """
 
-    def __init__(self, maze_cls: _Maze, shortest_path_rewards: bool = False,
-                 track_states: bool = False, max_log_memory: int = 1000, **kwargs) -> None:
+    def __init__(self, maze_cls: _Maze, binary_rewards: bool = False, shortest_path_rewards: bool = False,
+                 prob: float = 1.0, track_states: bool = False, max_log_memory: int = 1000, **kwargs) -> None:
         super().__init__()
 
         self.maze = maze_cls
         self.motions = VonNeumannMotion()
+        self.reward_probability = prob  # Probability to yield reward upon encountering goal state.
+        self.binary_rewards = binary_rewards  # Overrides shortest path.  TODO: Rework dirty reward args.
         self.shortest_path_rewards = shortest_path_rewards
 
         self.observation_space = Box(low=0, high=len(self.maze.objects), shape=self.maze.size, dtype=np.uint8)
@@ -88,15 +91,30 @@ class _Env(BaseEnv):
 
         # Reward specification. Reward is either shaped or binary (sparse shortest-path reward).
         done = self._is_goal(coord_next)
-        if self.shortest_path_rewards or not valid:
+
+        # Reward function cases.
+        if self.shortest_path_rewards:
             reward = -1
+            if done and np.random.rand() < self.reward_probability:
+                reward = 0
+        elif self.binary_rewards:
+            reward = 0
+            if done and np.random.rand() < self.reward_probability:
+                reward = 1
         else:
-            reward = 1 if done else -0.01
+            reward = -1
+            if valid:
+                reward = -0.01
+                if done and np.random.rand() < self.reward_probability:
+                    reward = 1
 
         if self.track_states:
             self.state_count[coord_next[0], coord_next[1]] += 1
 
         return self.maze.to_value(), reward, done, {'coord': coord_t, 'coord_next': coord_next, 'goal_achieved': done}
+
+    def clone(self):
+        return deepcopy(self)
 
     def reset(self):
         self.steps = 0

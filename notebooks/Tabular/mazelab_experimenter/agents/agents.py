@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import typing
 import heapq
 import sys
 import random
+from dataclasses import dataclass
 from abc import ABC
 
 import numpy as np
@@ -9,7 +12,7 @@ import gym
 import tqdm
 
 from .interface import Agent
-from mazelab_experimenter.utils import find, MazeObjects
+from mazelab_experimenter.utils import find, MazeObjects, rand_argmax
 
 
 class RandomAgent(Agent):
@@ -49,7 +52,7 @@ class MonteCarloQLearner(TabularQLearner):
     """ Implements an Off-Policy Monte Carlo agent that learns a Q-table. """
 
     def __init__(self, observation_shape: typing.Tuple[int, int], n_actions: int):
-        super().__init__(observation_shape=observation_shape, n_actions=n_actions, q_init=q_init)
+        super().__init__(observation_shape=observation_shape, n_actions=n_actions, q_init=0.0)
 
 
 class TabularQLearning(TabularQLearner):
@@ -112,8 +115,249 @@ class TabularQLearning(TabularQLearner):
             _env.close()
 
 
+class TabularQLearningN(TabularQLearning):
+    """ Simple n-step SARSA and n-step Tree Backup implementation of Sutton and Barto 2018. """
+
+    @dataclass
+    class Transition:
+        state: np.ndarray
+        action: int
+        reward: float
+        next_state: np.ndarray
+        terminal: bool
+
+    def __init__(self, observation_shape: typing.Tuple[int, int], n_actions: int, lr: float = 0.5, n_steps: int = 1,
+                 epsilon: float = 0.1, discount: float = 0.95, sarsa: bool = False, q_init: float = 0.0) -> None:
+        super().__init__(observation_shape=observation_shape, n_actions=n_actions, lr=lr,
+                         epsilon=epsilon, discount=discount, sarsa=sarsa, q_init=q_init)
+        self.n_steps = n_steps  # Uses Tree-Backup(n) for sarsa = False, otherwise simply n-step SARSA.
+
+    def tree_backup(self, transitions: typing.List[TabularQLearningN.Transition], t_start: int) -> None:
+        # Basic n-step Tree Backup
+        transition_t = transitions[t_start]
+        transition_T = transitions[-1]
+
+        # Get indices within Q-table corresponding to the given states.
+        pos_start = self._get_pos(transitions[t_start].state)  # 1D 2-element arrays
+
+        if transition_T.terminal:
+            G = transition_T.reward
+        else:
+            pos_end = self._get_pos(transition_T.next_state)
+            a_end = self.sample(transition_T.next_state, behaviour_policy=self._sarsa)
+            G = transition_T.reward + self.discount * self._q_table[pos_end][a_end]
+
+        # Backup from leaf node, cut traces where a != a* if using Q-learning.
+        for k in reversed(range(t_start, len(transitions) - 1)):
+            # Awkward indexing due to r_t being stored under transition_t.
+            s_k, a_k = transitions[k + 1].state, transitions[k + 1].action
+
+            if not self._sarsa:  # If off-policy (optimal Q^*) reset n-step trace at every non-greedy action.
+                pos_k = self._get_pos(s_k)  # 1D 2-element arrays
+                a_greedy = self.sample(s_k, behaviour_policy=False)
+
+                # Reset trace if selected action isn't Q-optimal (don't reset in case of ties).
+                if not np.isclose(self._q_table[pos_k][a_greedy], self._q_table[pos_k][a_k]):
+                    G = self._q_table[pos_k][a_greedy]
+
+            # Generalizes n-step SARSA.
+            G = transitions[k].reward + self.discount * G
+
+        # Q-learning update
+        self._q_table[pos_start][transition_t.action] += self.lr * (G - self._q_table[pos_start][transition_t.action])
+        self._updates += 1
+
+    def update(self, transitions: typing.List[TabularQLearningN.Transition], t: int, **kwargs) -> None:
+        tau = t - self.n_steps + 1
+        if tau >= 0:
+            for i in range(tau, tau + self.n_steps ** int(transitions[-1].terminal)):
+                self.tree_backup(transitions, i)
+
+    def train(self, _env: gym.Env, num_episodes: int, progress_bar: bool = False) -> None:
+        iterator = (tqdm.trange(num_episodes, file=sys.stdout, desc="TabularQLearning Training")
+                    if progress_bar else range(num_episodes))
+
+        for _ in iterator:
+            # Reinitialize environment after each episode.
+            state, goal_achieved, done = _env.reset(), False, False
+
+            # n-step buffer
+            transitions = list()
+
+            t = 0
+            while not done:
+                # Update to the next state.
+                a = self.sample(state)
+                next_state, r, done, meta = _env.step(a)
+
+                # Annotate an episode as done if the agent is actually in a goal-state (not if the time expires).
+                goal_achieved = meta['goal_achieved']
+
+                # Perform n-step Q-learning update.
+                transitions.append(TabularQLearningN.Transition(state, a, r, next_state, goal_achieved))
+                self.update(transitions, t, meta=meta)
+
+                # Update state of control
+                state = next_state
+                t += 1
+
+            # Cleanup environment variables
+            _env.close()
+
+
+class TabularQLambda(TabularQLearningN):
+    """ Implements a simple Tree-Backup(λ) agent (subsuming SARSA(λ)) optionally with replacing traces. """
+
+    def __init__(self, observation_shape: typing.Tuple[int, int], n_actions: int, lr: float = 0.5, decay: float = 0.9,
+                 n_steps: int = None, epsilon: float = 0.1, discount: float = 0.95, replace: bool = False,
+                 decay_lr: float = -0.5, sarsa: bool = False, q_init: float = 0.0) -> None:
+        super().__init__(observation_shape=observation_shape, n_actions=n_actions, lr=lr, n_steps=None,
+                         epsilon=epsilon, discount=discount, sarsa=sarsa, q_init=q_init)
+        # Learning rate scheduling (Q-values may diverge if not used)
+        self.decay_lr = decay_lr
+        self._lr_base = lr
+
+        self.decay = decay
+        self.replace = replace
+        self.trace = np.zeros_like(self._q_table, dtype=np.float32)
+
+        self.episodes = 0
+
+    def update_step_sizes(self) -> None:
+        self.lr = self._lr_base * (self.episodes ** self.decay_lr)
+
+    def reset(self) -> None:
+        super().reset()
+        self.lr = self._lr_base
+        self.episodes = 0
+
+    def update(self, transition: TabularQLearningN.Transition, **kwargs) -> typing.Optional[typing.Any]:
+        # Get indices within Q-table and trace corresponding to the given states.
+        pos_t, pos_next = self._get_pos(transition.state), self._get_pos(transition.next_state)  # 1D 2-element arrays
+        # Get bootstrap and update actions.
+        a_t, a_t_next = transition.action, self.sample(transition.next_state, behaviour_policy=self._sarsa)
+
+        # Update eligibility trace. SARSA(λ) for retain = 1, TB(λ) for retain = 0.
+        retain = 1
+        if not self._sarsa:  # TB(λ)
+            a_greedy = self.sample(transition.state, behaviour_policy=False)
+
+            # Reset trace if selected action isn't Q-optimal (don't reset in case of ties).
+            if not np.isclose(self._q_table[pos_t][a_greedy], self._q_table[pos_t][transition.action]):
+                retain = 0
+
+        # Replacing traces: Compute z_t = γλπ(a|s)z_(t-1) + ∇q(s, a, w), w are the 'weights' == Q-table averages.
+        self.trace = self.discount * self.decay * retain * self.trace
+        if self.replace:  # Reset trace on revisits.
+            self.trace[pos_t][...] = 0
+            self.trace[pos_t][a_t] = 1
+        else:  # Accumulate trace
+            self.trace[pos_t][a_t] += 1
+
+        # Compute the Bellman error
+        delta = transition.reward + self.discount * self._q_table[pos_next][a_t_next] - self._q_table[pos_t][a_t]
+
+        # SARSA(λ) update to critic parameters w.
+        self._q_table += self.lr * delta * self.trace
+
+    def train(self, _env: gym.Env, num_episodes: int, progress_bar: bool = False) -> None:
+        iterator = (tqdm.trange(num_episodes, file=sys.stdout, desc="TabularQLearning Training")
+                    if progress_bar else range(num_episodes))
+
+        for _ in iterator:
+            # Reinitialize environment after each episode.
+            state, goal_achieved, done = _env.reset(), False, False
+            self.episodes += 1
+
+            # Initialize agent dependencies
+            self.trace[...] = 0
+            self.update_step_sizes()
+
+            t = 0
+            while not done:
+                # Update to the next state.
+                a = self.sample(state)
+                next_state, r, done, meta = _env.step(a)
+
+                # Annotate an episode as done if the agent is actually in a goal-state (not if the time expires).
+                goal_achieved = meta['goal_achieved']
+
+                # Perform n-step Q-learning update.
+                self.update(TabularQLearningN.Transition(state, a, r, next_state, goal_achieved), meta=meta)
+
+                # Update state of control
+                state = next_state
+                t += 1
+
+            # Cleanup environment variables
+            _env.close()
+
+
+class TabularQET(TabularQLambda):
+
+    def __init__(self, observation_shape: typing.Tuple[int, int], n_actions: int, lr: float = 0.5, decay: float = 0.9,
+                 n_steps: int = None, epsilon: float = 0.1, discount: float = 0.95, replace: bool = False,
+                 decay_lr: float = -0.5, eta: float = 0.0, beta: float = 0.5, sarsa: bool = False,
+                 q_init: float = 0.0) -> None:
+        super().__init__(observation_shape=observation_shape, n_actions=n_actions, lr=lr, n_steps=None, decay=decay,
+                         decay_lr=decay_lr, replace=replace, epsilon=epsilon, discount=discount, sarsa=sarsa,
+                         q_init=q_init)
+        # Learning rate scheduling for trace model
+        self._beta_base = beta
+
+        self.eta = eta    # Interpolation variable between eligibility trace and expected trace.
+        self.beta = beta  # Expected trace learning rate.
+        self.trace_model = np.zeros((*self.trace.shape, *self.trace.shape), dtype=np.float32)
+
+    def update_step_sizes(self) -> None:
+        self.lr = self._lr_base * (self.episodes ** self.decay_lr)
+        self.beta = self._beta_base * (self.episodes ** self.decay_lr)
+
+    def reset(self) -> None:
+        super().reset()
+        self.lr = self._lr_base
+        self.beta = self._beta_base
+        self.trace_model[...] = 0
+
+    def update(self, transition: TabularQLearningN.Transition, **kwargs) -> typing.Optional[typing.Any]:
+        # Get indices within Q-table and trace corresponding to the given states.
+        pos_t, pos_next = self._get_pos(transition.state), self._get_pos(transition.next_state)  # 1D 2-element arrays
+        # Get bootstrap and update actions.
+        a_t, a_t_next = transition.action, self.sample(transition.next_state, behaviour_policy=self._sarsa)
+
+        # Update eligibility trace.
+        retain = 1
+        if not self._sarsa:  # TB(λ)
+            a_greedy = self.sample(transition.state, behaviour_policy=False)
+
+            # Reset trace if selected action isn't Q-optimal (don't reset in case of ties).
+            if not np.isclose(self._q_table[pos_t][a_greedy], self._q_table[pos_t][transition.action]):
+                retain = 0
+
+        # Replacing traces: Compute z_t = γλπ(a|s)z_(t-1) + ∇q(s, a, w), w are the 'weights' == Q-table averages.
+        self.trace = self.discount * self.decay * retain * self.trace
+        if self.replace:  # Reset trace on revisits.
+            self.trace[pos_t][...] = 0
+            self.trace[pos_t][a_t] = 1
+        else:  # Accumulate trace
+            self.trace[pos_t][a_t] += 1
+
+        # Compute the Bellman error
+        delta = transition.reward + self.discount * self._q_table[pos_next][a_t_next] - self._q_table[pos_t][a_t]
+
+        # Update the Expected Eligibility trace Model.
+        self.trace_model[pos_t][a_t] += self.beta * (self.trace - self.trace_model[pos_t][a_t])
+
+        # ET(λ, η) update for the critic parameters w.
+        ys = (1 - self.eta) * self.trace_model[pos_t][a_t] + self.eta * self.trace
+        self._q_table += self.lr * delta * ys
+
+
 class TabularDynaQ(TabularQLearning):
-    """ A deterministic tabular (Prioritized Sweeping) DynaQ agent as described by Sutton et al., 2018 Chapter 8.2, 8.3, and 8.4. """
+    """
+    A deterministic tabular (Prioritized Sweeping) DynaQ agent as described by Sutton et al., 2018
+    Chapter 8.2, 8.3, and 8.4.
+    """
 
     def __init__(self, observation_shape: typing.Tuple[int, int], n_actions: int, n_iter: int = 10,
                  priority: float = 0.0, lr: float = 0.5, epsilon: float = 0.1, discount: float = 0.95,

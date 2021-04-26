@@ -7,7 +7,9 @@ import numpy as np
 
 class Agent(ABC):
     """ Basic Agent interface, inherit this class to implement algorithms compatible with the experimentation API. """
-    
+    _NEUMANN_MOTION: int = 1
+    _MOORE_MOTION: int = 2
+
     def __init__(self, observation_shape: typing.Tuple, n_actions: int) -> None:
         """ Initialize root with domain dimensions. 
         :param observation_shape: tuple Indicates the dimensionality of the environment's observations.
@@ -15,6 +17,7 @@ class Agent(ABC):
         """
         self.observation_shape = observation_shape
         self.n_actions = n_actions
+        self.motion = self._NEUMANN_MOTION if n_actions == 4 else self._MOORE_MOTION
     
     @abstractmethod
     def reset(self) -> None:

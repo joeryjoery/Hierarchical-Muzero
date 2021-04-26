@@ -11,6 +11,10 @@ import numpy as np
 from mazelab_experimenter.agents import Agent
 
 
+def exec_func(func: typing.Callable):
+    return func()
+
+
 class Hook(ABC):
     """ Basic interface for a monitorring Callback that can be used to evaluate an Agent's progress. """
     
@@ -29,7 +33,38 @@ class Hook(ABC):
     @abstractmethod
     def aggregate(self, refresh: bool = False, **kwargs) -> typing.Generic:
         """ Aggregate all internal state variables and return the result. """
-        
+
+
+class PredictionErrorHook(Hook):
+
+    _LABELS = ["Prediction Error"]
+
+    def __init__(self, reference: np.ndarray, get_critic: typing.Callable, f_aggr: typing.Callable = np.mean) -> None:
+        """Initialize the monitorring hook with an aggregation function. Defaults to a sample average.
+
+        :param f_aggr: typing.Callable Aggregation function for summarizing collected statistics.
+        """
+        super().__init__()
+        self._reference = reference
+        self._get_critic = get_critic
+        self._values = list()
+        self._f_aggr = f_aggr
+
+    def labels(self) -> typing.List:
+        """ Get labels for the aggregated values. """
+        return PredictionErrorHook._LABELS
+
+    def clear(self) -> None:
+        """ Clear internal state variables. """
+        self._values.clear()
+
+    def collect(self, agent: Agent, **kwargs) -> None:
+        """ Log whether the agent reached a goal state, its cumulative episode reward, and the episode length. """
+        self._values.append(self._get_critic(agent) - self._reference)  # TODO
+
+    def aggregate(self, **kwargs) -> typing.Generic:
+        return [self._f_aggr(v) for v in self._values]
+
 
 class GenericOuterHook(Hook):
     """ Simple episodic monitor for control agents that logs and aggregates the success-rate, cumulative reward, and episode length. """
@@ -84,7 +119,8 @@ def train(_env: gym.Env, _agent: Agent, _num_episodes: int, _agent_kwargs: typin
 
 def evaluate(_env: gym.Env, _agent: Agent, _num_evals: int, agent_kwargs: typing.Dict, 
              outer_loop_hooks: typing.List[Hook], inner_loop_hooks: typing.Optional[typing.List[Hook]] = None,
-             progress_bar: bool = False, clear_outer_hook: bool = True, render: bool = False, **kwargs) -> typing.Tuple[typing.List, typing.List]:
+             progress_bar: bool = False, clear_outer_hook: bool = True, render: bool = False,
+             **kwargs) -> typing.Tuple[typing.List, typing.List]:
     """Defines the core framework for evaluating a control agent on a given environment.
     
     See the benchmark function for extended documentation on Hooks and keyword arguments.
@@ -159,22 +195,19 @@ def evaluate(_env: gym.Env, _agent: Agent, _num_evals: int, agent_kwargs: typing
     return outer_loop_data, inner_loop_data
 
 
-
-def benchmark(env_id: str, _agent_gen: typing.Callable, agent_test_kwargs: typing.Dict, agent_train_kwargs: typing.Dict,
+def benchmark(env_id: typing.Union[str, gym.Env], _agent_gen: typing.Callable,
+              agent_test_kwargs: typing.Dict, agent_train_kwargs: typing.Dict,
               num_repetitions: int, num_iterations: int, num_episodes: int, num_trials: int,
-              evaluation_hooks: typing.List[Hook], verbose: bool = True, 
-              asynchronous: bool = False, **kwargs) -> typing.List:
+              evaluation_hooks: typing.List[Hook], verbose: bool = True, **kwargs) -> typing.List:
     """Full functionality for benchmarking a single reinforcement learning.
-    
-    This function can either be run on a single thread (default) or run each repetition asynchronously batch-wise (NOT YET IMPLEMENTED).
-    
+
     The function initializes a fresh gym environment given a string identifier along with a fresh agent, it then repeats a train-test loop
     and logs only evaluation statistics through the evaluation_hooks. The function returns the per test-episode aggregated Hook data. 
     
-    The Hook class is a monitorring class similarly to keras.Callbacks that is used here strictly for outer-episode statistics.
+    The Hook class is a monitoring class similarly to keras.Callbacks that is used here strictly for outer-episode statistics.
     To log inner-loop statistics, use the `evaluate` function instead.
     
-    :param env_id: str Environment identifier that has been registered in the OpenAI Gym framework.
+    :param env_id: str Environment identifier that has been registered in the OpenAI Gym framework or the env itself.
     :param _agent_gen: typing.Callable A function that yields an Agent object to be trained and evaluated (benchmarked).
     :param agent_test_kwargs: dict Keyword arguments for the agent's action selection during evaluation.
     :param agent_train_kwargs: dict Keyword arguments specific for the agent's training loop.
@@ -184,56 +217,52 @@ def benchmark(env_id: str, _agent_gen: typing.Callable, agent_test_kwargs: typin
     :param num_trials: int Number of times to evaluate the agent after an iteration of training (set to 1 if greedy-deterministic!).
     :param evaluation_hooks: list of Hook objects that log evaluation statistics of the agent.
     :param verbose: bool Whether to print out a progress bar and ETA for finishing the experiment.
-    :param asynchronous: bool Whether to use multiple threads for running repetitions (waits until last finished; NOT YET IMPLEMENTED).
-    
+
     :returns: list of evaluation data (computed by the evaluation_hooks) for each repetition.
     
     :see: evaluate
     """
-    if asynchronous:
-        raise NotImplemented("Asynchronous benchmarking is not yet supported.")
-    else:
-        # Initialize agent and environment.
-        env = gym.make(env_id)
-        agent = _agent_gen()
-        
-        t_0 = time.time()
-        repetition_data = list()
-        for r in range(num_repetitions):
-            # Ensure we have a freshly initialized agent.
-            agent.reset()
-            
-            if verbose:
-                # If specified log time statistics to the console.
-                rate = (time.time() - t_0) / r if r else 0
-                eta = datetime.timedelta(seconds=int((num_repetitions - r) * rate)) if r else ""
-                print(f"-- Benchmarking Repetition {r+1} / {num_repetitions} --- ETA: {str(eta)} --- Rate: {int(rate)} sec/ it")
-            
-            # Test the freshly initialized agent (without parameter updates; may take a couple of seconds) and store results.
-            data = [
+    # Initialize agent and environment.
+    env = gym.make(env_id) if isinstance(env_id, str) else env_id
+    agent = _agent_gen()
+
+    t_0 = time.time()
+    repetition_data = list()
+    for r in range(num_repetitions):
+        # Ensure we have a freshly initialized agent.
+        agent.reset()
+
+        if verbose:
+            # If specified log time statistics to the console.
+            rate = (time.time() - t_0) / r if r else 0
+            eta = datetime.timedelta(seconds=int((num_repetitions - r) * rate)) if r else ""
+            print(f"-- Benchmarking Repetition {r+1} / {num_repetitions} --- ETA: {str(eta)} --- Rate: {int(rate)} sec/ it")
+
+        # Test the freshly initialized agent (without parameter updates) and store results.
+        data = [
+            evaluate(
+                _env=env, _agent=agent, _num_evals=num_trials,
+                agent_kwargs=agent_test_kwargs,
+                outer_loop_hooks=evaluation_hooks,
+                clear_outer_hook=True,
+                progress_bar=False)[0]
+        ]
+
+        for _ in (tqdm.trange(num_iterations, file=sys.stdout, desc="Train-Test loop") if verbose else range(num_iterations)):
+            # Train the agent for a number of times
+            train(_env=env, _agent=agent, _num_episodes=num_episodes, _agent_kwargs=agent_train_kwargs)
+            # Evaluate agent and store data.
+            data.append(
                 evaluate(
-                    _env=env, _agent=agent, _num_evals=num_trials, 
-                    agent_kwargs=agent_test_kwargs, 
+                    _env=env, _agent=agent, _num_evals=num_trials,
+                    agent_kwargs=agent_test_kwargs,
                     outer_loop_hooks=evaluation_hooks,
                     clear_outer_hook=True,
                     progress_bar=False)[0]
-            ]
-            
-            for _ in (tqdm.trange(num_iterations, file=sys.stdout, desc="Train-Test loop") if verbose else range(num_iterations)):
-                # Train the agent for a number of times
-                train(_env=env, _agent=agent, _num_episodes=num_episodes, _agent_kwargs=agent_train_kwargs)
-                # Evaluate agent and store data.
-                data.append(
-                    evaluate(
-                        _env=env, _agent=agent, _num_evals=num_trials, 
-                        agent_kwargs=agent_test_kwargs, 
-                        outer_loop_hooks=evaluation_hooks,
-                        clear_outer_hook=True,
-                        progress_bar=False)[0]
-                )
-            
-            # Store training-testing data and reinitialize the trained agent.
-            repetition_data.append(data)
-            
-        # Return benchmark results.
-        return repetition_data
+            )
+
+        # Store training-testing data and reinitialize the trained agent.
+        repetition_data.append(data)
+
+    # Return benchmark results.
+    return repetition_data

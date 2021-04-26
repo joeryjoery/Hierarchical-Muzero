@@ -40,7 +40,7 @@ class HierQ(TabularHierarchicalAgent):
 
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
                  horizons: typing.Union[typing.List[int]], lr: float = 0.5, epsilon: float = 0.1,
-                 discount: float = 0.95, ignore_training_time: bool = False) -> None:
+                 discount: float = 0.95) -> None:
         super().__init__(observation_shape=observation_shape, n_actions=n_actions, n_levels=n_levels)
 
         assert type(horizons) == int or (type(horizons) == list and len(horizons) == n_levels), \
@@ -55,7 +55,6 @@ class HierQ(TabularHierarchicalAgent):
         self.lr = lr
         self.epsilon = epsilon
         self.discount = discount
-        self.ignore_training_time = ignore_training_time
         self.horizons = np.full(n_levels, horizons, dtype=np.int32) \
             if type(horizons) == int else np.asarray(horizons, dtype=np.int32)
 
@@ -107,7 +106,7 @@ class HierQ(TabularHierarchicalAgent):
 
         # Sample a new action and new goals by iterating and sampling actions from the top to the bottom policy.
         for lvl in reversed(range(self.n_levels)):
-            if lvl == 0 or self._level_goals[lvl - 1] is None:
+            if (lvl == 0) or (self._level_goals[lvl - 1] is None):
                 # Get the (behaviour) policy action according to the current level.
                 a = self.get_level_action(s=s, g=self._level_goals[lvl], level=lvl, explore=behaviour_policy)
                 self._goal_steps[lvl] += 1
@@ -121,7 +120,7 @@ class HierQ(TabularHierarchicalAgent):
         """Train level function of Algorithm 2 HierQ by (Levy et al., 2019).
         """
         step, done = 0, False
-        while step < self.horizons[level] and state not in goal_stack and (not done or self.ignore_training_time):
+        while (step < self.horizons[level]) and (state not in goal_stack) and (not done):
             # Sample an action at the current hierarchy level.
             a = self.get_level_action(s=state, g=goal_stack[-1], level=level)
 
@@ -134,7 +133,7 @@ class HierQ(TabularHierarchicalAgent):
                 # Keep a memory of observed states to update Q-tables with hindsight.
                 if state != s_next:
                     for d in self._previous_states:
-                        d.append(s_next)
+                        d.append(state)
 
                 # At each level, update Q-tables for each trailing state for all possible subgoals.
                 self.update_critic(0, state, a, s_next, self.G[0])
@@ -165,7 +164,7 @@ class HierQ(TabularHierarchicalAgent):
                 d.clear()
 
             done = False
-            while not done and state != goal_stack[0]:
+            while (not done) and (state != goal_stack[0]):
                 # Sample a goal as a temporally extended action and observe UMDP transition until env termination.
                 a = self.get_level_action(s=state, g=goal_stack[-1], level=self.n_levels - 1)
                 state, done = self.update(
