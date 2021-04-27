@@ -1,7 +1,7 @@
 from __future__ import annotations
 import typing
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import deque
 
 import numpy as np
@@ -268,14 +268,42 @@ class HierQV2Indev(TabularHierarchicalAgent):
     @dataclass
     class GoalTransition:
         state: np.ndarray
-        goal: typing.Union[int, np.ndarray]  # Singular goal or multiple (HER)
+        goal: typing.Union[int, np.ndarray]  # Can be intrinsic, extrinsic, a singular goal, or multiple (HER)
         action: int
         next_state: np.ndarray
+        terminal: bool
         reward: typing.Optional[float]  # Rewards can be extrinsic or derived from (state == goal).
 
         @property
         def degenerate(self) -> bool:
             return self.state == self.next_state
+
+    @dataclass
+    class HierarchicalTrace:  # Accessible as a Sequence[GoalTransition] object.
+        num_levels: int  # Number of hierarchies.
+        horizons: typing.List  # Trace-window for each hierarchy level and the environment level.
+        non_degenerate: bool = True  # Whether to access the trace using only the transitions where state != state_next
+        full: typing.List[HierQV2Indev.GoalTransition] = field(default_factory=list)  # Raw unfiltered trace.
+        transitions: typing.List[int] = field(default_factory=list)  # Trace indices where state != state_next
+
+        def __len__(self) -> int:
+            return len(self.transitions) if self.non_degenerate else len(self.full)
+
+        def __getitem__(self, t: typing.Union[int, slice]) -> HierQV2Indev.GoalTransition:
+            return [self.full[i] for i in [*self.transitions[t]]] if self.non_degenerate else self.full[t]
+
+        def window(self, level: int) -> int:
+            """Get the size of the currently open window of trailing states for the given hierarchy level."""
+            return min([self.horizons[level], len(self)])
+
+        def add(self, transition: HierQV2Indev.GoalTransition) -> None:
+            self.full.append(transition)
+            if not transition.degenerate:
+                self.transitions.append(len(self.full) - 1)
+
+        def reset(self):
+            self.full.clear()
+            self.transitions.clear()
 
     @dataclass
     class CriticTable:
@@ -330,7 +358,8 @@ class HierQV2Indev(TabularHierarchicalAgent):
         self.lr = lr
         self.epsilon = epsilon
         self.discount = discount
-        self.n_steps = n_steps
+        self.n_steps = np.full(n_levels, n_steps, dtype=np.int32) \
+            if type(n_steps) == int else np.asarray(n_steps, dtype=np.int32)
         self.relative_goals = relative_goals
         self.universal_top = universal_top
         self.horizons = np.full(n_levels, horizons, dtype=np.int32) \
@@ -347,9 +376,11 @@ class HierQV2Indev(TabularHierarchicalAgent):
 
             self.critics.append(critic)
 
-        # Previous states array keeps track of positions during training for each level i, 0 < i <= n_levels
-        self._previous_states = [deque(maxlen=int(np.prod(self.horizons[:(i + 1)]))) for i in range(self.n_levels - 1)]
-        self._transitions = list()
+        # Data structures for keeping track of an environment trace along with a deque that retains previous
+        # states within the hierarchical policies' action horizon. Last atomic_horizon value should be large.
+        atomic_horizons = [int(np.prod(self.horizons[:i])) for i in range(0, self.n_levels + 1)]
+        self.trace = HierQV2Indev.HierarchicalTrace(num_levels=self.n_levels, horizons=atomic_horizons)
+        self.trace.reset()
 
     @staticmethod
     def _get_pos(observation: np.ndarray) -> np.ndarray:
@@ -460,32 +491,21 @@ class HierQV2Indev(TabularHierarchicalAgent):
                 s_next, terminal = self._get_index(meta['coord_next']), meta['goal_achieved']
 
                 # Keep a memory of observed states to update Q-tables with hindsight.
-                transition = HierQV2Indev.GoalTransition(
-                    state=state, goal=goal_stack[0], action=a, next_state=s_next, reward=None)
-                self.update_critic(0, state, a, s_next)
-                if not transition.degenerate:
-                    for d in self._previous_states:
-                        d.append(transition)
+                self.trace.add(HierQV2Indev.GoalTransition(
+                    state=state, goal=goal_stack[0], action=a, next_state=s_next, terminal=terminal, reward=None))
 
-                # Update on last transition inside a list.  TODO: n-steps for atomic.
-                # self.tree_backup(level=0, transitions=self._transitions[-1:])
-
-                    for i in range(1, self.n_levels):
-                        # h = np.prod(self.horizons[:i])  # Trailing state-window size.
-
-                        for t_mem in self._previous_states[i - 1]:
-                            self.update_critic(i, t_mem.state, s_next, s_next, end_pos=goal_stack[0])
-                    # Loop over each trailing window state as a time index.
-                        # for t in range(max([0, len(self._transitions) - h]), len(self._transitions)):
-                        #     self.update_critic(level=i, time=t)  # Default update
-                            # Loop for n = 1 to N if terminal. Else only use n = N
-                            # for n in range(int(not terminal) * (self.n_steps - 1), self.n_steps):
-                            #     # Get n-step backup start index.
-                            #     tau = t - n * h
-                            #     if tau >= 0:
-                            #         pass
-                            #         # Do tree backup for transitions tau, tau + h, tau + 2h, ..., tau + Nh.
-                            #         # self.tree_backup(level=i, transitions=self._transitions[tau::h])
+                if self.trace.full[-1].degenerate:  # -> Only do a 1-step atomic update for illegal actions.
+                    self.tree_backup(0, *self.build_backup_tree(self.trace.full, step=0, horizon=1, n=1))
+                else:
+                    # Update every hierarchy level with a n-step Tree Backup.
+                    for i in range(self.n_levels):
+                        # Update critics based on the trailing states within the agent window.  TODO: Batch-update.
+                        for h in range(self.trace.window(i)):
+                            # Construct n-step backup tree. Uses n = 0, ..., N at trace termination.
+                            for n in range(1 + (self.n_steps[i] - 1) * int(not terminal), 1 + self.n_steps[i]):
+                                if h + self.trace.horizons[i] * (n - 1) < len(self.trace):
+                                    self.tree_backup(i, *self.build_backup_tree(
+                                        self.trace, step=h, horizon=self.trace.horizons[i], n=n))
 
             # Update state of control.
             state = s_next
@@ -493,94 +513,55 @@ class HierQV2Indev(TabularHierarchicalAgent):
 
         return state, done
 
-    def update_critic(self, level: int, s: int, a: int, s_next: int, end_pos: int = None) -> None:
-        """Update Q-Tables with given transition """
+    @staticmethod
+    def build_backup_tree(trace: typing.Sequence[HierQV2Indev.GoalTransition],
+                          step: int, horizon: int, n: int) -> typing.Tuple[typing.List[HierQV2Indev.GoalTransition],
+                                                                           typing.List[HierQV2Indev.GoalTransition]]:
+        return trace[-(step + 1 + horizon * (n - 1))::horizon], trace[-(1 + horizon * (n - 1))::horizon]
 
-        if level and self.relative_goals:  # Convert subgoal-action 'a' from Absolute-to-Neighborhood.
-            delta = np.asarray(np.unravel_index([s, a], self.observation_shape))
-            a = self.ravel_delta_indices(np.diff(delta).T, r=self.G_radii[level - 1], motion=self.motion).item()
-
-        goals = self.G[level]
-        mask = goals == s_next          # Hindsight action transition mask.
-        if not self.critics[level].goal_conditioned:
-            goals = 0                   # Correct for non-universal critic.
-            mask = end_pos == s_next    # Correct hindsight action transition mask.
-
-        # Q-Learning update for each goal-state.
-        ys = mask + (1 - mask) * self.discount * np.amax(self.critics[level].table[s_next, goals], axis=-1)
-        self.critics[level].table[s, goals, a] += self.lr * (ys - self.critics[level].table[s, goals, a])
-
-    #
-    # def update_critic(self, level: int, time: int):
-    #     s = self._transitions[time].state
-    #     s_next = self._transitions[time].next_state
-    #     a = self._transitions[time].next_state if level else self._transitions[time].action
-    #
-    #     if level and self.relative_goals:
-    #         delta = np.asarray(np.unravel_index([s, a], self.observation_shape))
-    #         a = self.ravel_delta_indices(np.diff(delta).T, r=self.G_radii[level - 1], motion=self.motion).item()
-    #
-    #     goals = self.G[level]
-    #     mask = goals == self._transitions[time].next_state
-    #     if not self.critics[level].goal_conditioned:
-    #         goals = 0
-    #         mask = self._transitions[time].goal == self._transitions[time].next_state
-    #
-    #     # Target calculation
-    #     rewards = mask  # Ablation 1
-    #     ys = rewards + (1 - mask) * self.discount * np.amax(self.critics[level].table[s_next, goals], axis=-1)
-    #
-    #     self.critics[level].table[s, goals, a] += self.lr * (ys - self.critics[level].table[s, goals, a])
-
-    def tree_backup(self, level: int, transitions: typing.List[HierQV2Indev.GoalTransition]) -> None:
+    def tree_backup(self, level: int, base_transitions: typing.List[HierQV2Indev.GoalTransition],
+                    target_transitions: typing.List[HierQV2Indev.GoalTransition] = None) -> None:
         # Basic n-step Tree Backup based on the given transition list (time-index invariant).
-        transition_t, transition_T = transitions[0], transitions[-1]
+        # > t-start and t-next serve as the (state, action) pair and t_end serves as the n-step lookahead target.
+        t_start, t_next, t_end = base_transitions[0], target_transitions[0], target_transitions[-1]
 
         # Get state-action for the Q-update.
-        s = transition_t.state
-        a = transition_t.next_state if level else transition_t.action
-        if level and self.relative_goals:
+        s = t_start.state
+        a = t_next.next_state if level else t_start.action
+        if level and self.relative_goals:  # Action correction for relative action spaces.
             delta = np.asarray(np.unravel_index([s, a], self.observation_shape))
             a = self.ravel_delta_indices(np.diff(delta).T, r=self.G_radii[level - 1], motion=self.motion).item()
 
         # Terminal reward calculation based on achieving state-goals.
-        if self.critics[level].goal_conditioned:
-            goals = self.G[level]
-            mask = goals == transition_T.next_state
-        else:
-            goals = 0
-            mask = transition_T.goal == transition_T.next_state
+        goals, mask = (self.G[level], self.G[level] == t_end.next_state) \
+            if self.critics[level].goal_conditioned else (0, t_end.terminal)
 
         # Target calculation
         r_T = mask
-        Q_T = np.amax(self.critics[level].table[transition_T.next_state, goals], axis=-1)
-
-        # Terminal n-step lookahead target.
-        G = r_T + (1 - mask) * self.discount * Q_T
+        Q_T = np.amax(self.critics[level].table[t_end.next_state, goals], axis=-1)
+        G = r_T + (1 - mask) * self.discount * Q_T   # n-step lookahead target.
 
         # Backup from leaf node, cut traces where a != a* and reset G to a new bootstrap target.
-        for k in reversed(range(0, len(transitions) - 1)):
-            s_k = transitions[k + 1].state
-            a_k = transitions[k + 1].next_state if level else transitions[k + 1].action
+        for k in reversed(range(0, len(base_transitions) - 1)):
+            t_k, t_k_next = base_transitions[k], target_transitions[k]  # For atomic policy t_k == t_k_next
 
-            # Hindsight target calculation.
-            if self.critics[level].goal_conditioned:
-                r_k = goals == transitions[k+1].next_state
-            else:
-                r_k = transitions[k+1].goal == transitions[k+1].next_state
+            # Extract (s, a) pair for backup.
+            s_k, a_k = t_k.state, (t_k_next.next_state if level else t_k.action)
 
-            # Action correction for relative goal spaces.
-            if level and self.relative_goals:
+            if level and self.relative_goals:   # Action correction for relative action spaces.
                 delta = np.asarray(np.unravel_index([s_k, a_k], self.observation_shape))
                 a_k = self.ravel_delta_indices(np.diff(delta).T, r=self.G_radii[level - 1], motion=self.motion).item()
 
+            # Hindsight targets at every backup step. t_k_next.terminal should always be 0.
+            r_mask = goals == t_k_next.next_state if self.critics[level].goal_conditioned else t_k_next.terminal
+
             # Reset trace if selected action isn't Q-optimal (don't reset in case of ties).
             Q_k = np.max(self.critics[level].table[s_k, goals], axis=-1)
-            greedy_mask = np.isclose(Q_k, self.critics[level].table[s_k, goals, a_k])
-            G = greedy_mask * self.critics[level].table[s_k, goals, a_k] + (1 - greedy_mask) * Q_k
+            r_k = r_mask
 
-            # Generalizes n-step SARSA.
-            G = r_k + self.discount * G
+            # Backup G if a_k is a greedy action AND the transition is not terminal in hindsight.
+            G_mask = np.isclose(Q_k, self.critics[level].table[s_k, goals, a_k])  # boolean array
+            G = r_k + self.discount * (1 - r_mask) * ((1 - G_mask) * Q_k + G_mask * G)
 
         # n-step SARSA update
         self.critics[level].table[s, goals, a] += self.lr * (G - self.critics[level].table[s, goals, a])
@@ -598,10 +579,8 @@ class HierQV2Indev(TabularHierarchicalAgent):
             # Set top hierarchy goal/ environment goal (only one goal-state is supported for now)
             goal_stack = [self._get_index(_env.unwrapped.maze.get_end_pos()[0])]
 
-            for d in self._previous_states:
-                d.clear()
-            # Reset trace.
-            self._transitions.clear()
+            # Refresh trace-data.
+            self.trace.reset()
 
             done = False
             while (not done) and (state != goal_stack[0]):

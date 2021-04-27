@@ -234,9 +234,11 @@ def benchmark(env_id: typing.Union[str, gym.Env], _agent_gen: typing.Callable,
 
         if verbose:
             # If specified log time statistics to the console.
-            rate = (time.time() - t_0) / r if r else 0
+            total = time.time() - t_0
+            rate = total / r if r else 0
             eta = datetime.timedelta(seconds=int((num_repetitions - r) * rate)) if r else ""
-            print(f"-- Benchmarking Repetition {r+1} / {num_repetitions} --- ETA: {str(eta)} --- Rate: {int(rate)} sec/ it")
+            print(f"-- Benchmarking Repetition {r+1} / {num_repetitions} --- ETA: {str(eta)} "
+                  f"--- Rate: {int(rate)} sec/ it --- Total: {total / 60:.2f} min")
 
         # Test the freshly initialized agent (without parameter updates) and store results.
         data = [
