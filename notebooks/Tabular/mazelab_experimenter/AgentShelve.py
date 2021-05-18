@@ -16,10 +16,10 @@ class AgentShelve:
         'RandomAgent': agents.RandomAgent,
         'HierQ': agents.HierQ,
         'HierQV2': agents.HierQV2,
-        'HierQV2Indev': agents.HierQV2Indev,
+        'HierQTB': agents.HierQN,
         'HierQTD': agents.HierQTD,
         'HierQTS': agents.HierQTS,
-        'HierQET': agents.HierQET
+        'HierQLambda': agents.HierQLambda
     }
     
     @staticmethod

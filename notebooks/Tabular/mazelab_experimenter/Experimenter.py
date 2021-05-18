@@ -40,14 +40,14 @@ class PredictionErrorHook(Hook):
     _LABELS = ["Prediction Error"]
 
     def __init__(self, reference: np.ndarray, get_critic: typing.Callable, f_aggr: typing.Callable = np.mean) -> None:
-        """Initialize the monitorring hook with an aggregation function. Defaults to a sample average.
+        """Initialize the monitoring hook with an aggregation function. Defaults to a sample average.
 
         :param f_aggr: typing.Callable Aggregation function for summarizing collected statistics.
         """
         super().__init__()
         self._reference = reference
         self._get_critic = get_critic
-        self._values = list()
+        self._values = None
         self._f_aggr = f_aggr
 
     def labels(self) -> typing.List:
@@ -56,14 +56,14 @@ class PredictionErrorHook(Hook):
 
     def clear(self) -> None:
         """ Clear internal state variables. """
-        self._values.clear()
+        self._values = None
 
     def collect(self, agent: Agent, **kwargs) -> None:
         """ Log whether the agent reached a goal state, its cumulative episode reward, and the episode length. """
-        self._values.append(self._get_critic(agent) - self._reference)  # TODO
+        self._values = self._get_critic(agent) - self._reference
 
     def aggregate(self, **kwargs) -> typing.Generic:
-        return [self._f_aggr(v) for v in self._values]
+        return self._f_aggr(self._values)
 
 
 class GenericOuterHook(Hook):
@@ -92,11 +92,11 @@ class GenericOuterHook(Hook):
         self._cumulative.clear()
         self._length.clear()
         
-    def collect(self, success: float, cumulative: float, time: int, **kwargs) -> None:
+    def collect(self, success: float, cumulative: float, t: int, **kwargs) -> None:
         """ Log whether the agent reached a goal state, its cumulative episode reward, and the episode length. """
         self._success.append(success)
         self._cumulative.append(cumulative)
-        self._length.append(time)
+        self._length.append(t)
         
     def aggregate(self, **kwargs) -> typing.Tuple[float, float, float]:
         """ Aggregate the logged statistics over the episodes with self._f_aggr in order of self.labels. """
@@ -230,7 +230,7 @@ def benchmark(env_id: typing.Union[str, gym.Env], _agent_gen: typing.Callable,
     repetition_data = list()
     for r in range(num_repetitions):
         # Ensure we have a freshly initialized agent.
-        agent.reset()
+        agent.cut()
 
         if verbose:
             # If specified log time statistics to the console.

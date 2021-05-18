@@ -18,6 +18,11 @@ class MazeObjects(Enum):
     AGENT = 3
 
 
+def get_pos(maze: np.ndarray) -> typing.Tuple:
+    """ Find the state-space coordinate of the agent from an environment observation. """
+    return find(a=maze, predicate=lambda x: x == MazeObjects.AGENT.value)
+
+
 def rand_argmax(b: np.ndarray, preference: typing.Optional[np.ndarray] = None,
                 mask: typing.Optional[np.ndarray] = None, **kwargs) -> int:
     """ a random tie-breaking argmax supplemented with a selection preference and masking functionality. """
@@ -26,9 +31,10 @@ def rand_argmax(b: np.ndarray, preference: typing.Optional[np.ndarray] = None,
     else:
         indices = np.flatnonzero(np.isclose(b, b.max()))
 
-    pref = np.flatnonzero(indices == preference)
-    if len(pref):
-        return indices[np.random.choice(pref)]
+    if preference is not None:
+        pref = np.flatnonzero(indices == preference)
+        if len(pref):
+            return indices[np.random.choice(pref)]
     return np.random.choice(indices)
 
 
@@ -40,6 +46,16 @@ def manhattan_distance(a: np.ndarray, b: np.ndarray) -> int:
 def chebyshev_distance(a: np.ndarray, b: np.ndarray) -> int:
     """ Compute the Chebyshev/ L∞ distance between two 1D arrays of uniform dimensions."""
     return np.max(a - b)
+
+
+def neumann_neighborhood_size(radius: int) -> int:
+    """ Computes the number of tiles in a Von Neumann neighborhood (diamond pattern) given some radius. """
+    return radius ** 2 + (radius + 1) ** 2
+
+
+def moore_neighborhood_size(radius: int) -> int:
+    """ Computes the number of tiles in a Moore neighborhood (square pattern) given some radius. """
+    return (2 * radius + 1) ** 2
 
 
 def ravel_moore_index(coords: np.ndarray, radius: int, delta: bool = False) -> np.ndarray:
@@ -132,43 +148,17 @@ def unravel_neumann_index(indices: np.ndarray, radius: int, delta: bool = False)
     return np.stack([rows, cols], axis=1).astype(np.int32)  # Row, Column as matrix columns.
 
 
-def find(a: np.ndarray, predicate: typing.Callable):
+def find(a: np.ndarray, predicate: typing.Callable) -> typing.Optional[typing.Tuple]:
     """
-    Parameters
-    ----------
-    a : numpy.ndarray
-        Input data, can be of any dimension.
+    Get the first index tuple of 'a' that satisfies the given predicate.
 
-    predicate : function
-        An element-wise function which results in a boolean np.ndarray.
-
-    Returns
-    -------
-    index_generator : int
-        A generator of (indices, data value) tuples which make the predicate
-        True.
-
-    See Also
-    --------
-    where, nonzero
-
-    Notes
-    -----
-    This function is best used for finding the first, or first few, data values
-    which match the predicate.
-
-    Examples
-    --------
-    >>> a = np.sin(np.linspace(0, np.pi, 200))
-    >>> result = find(a, predicate=lambda x: x > 0.9)
-    >>> result
-    71
-    >>> np.where(a > 0.9)[0][0]
-    71
+    :param a: np.ndarray Some array.
+    :param predicate: typing.Callable A function that maps elements of a to {0, 1}.
+    :returns: The first tuple representing the index of 'a' that satisfies the predicate or None.
     """
     flat = a.ravel()
 
     mask = predicate(flat)
     idx = mask.view(bool).argmax() // mask.itemsize
 
-    return np.unravel_index(idx, a.shape, order='C') if flat[idx] else -1
+    return np.unravel_index(idx, a.shape, order='C') if flat[idx] else None

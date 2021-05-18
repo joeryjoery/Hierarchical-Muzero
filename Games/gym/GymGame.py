@@ -45,7 +45,7 @@ class GymGame(Game):
         for w in self.wrappers:
             env = w(env)
 
-        next_state = GymState(canonical_state=env.reset(), observation=None, action=-1, done=False, player=1, env=env)
+        next_state = GymState(canonical_state=env.cut(), observation=None, action=-1, done=False, player=1, env=env)
         next_state.observation = self.buildObservation(next_state)
 
         return next_state

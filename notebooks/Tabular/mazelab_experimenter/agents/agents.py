@@ -127,10 +127,15 @@ class TabularQLearningN(TabularQLearning):
         terminal: bool
 
     def __init__(self, observation_shape: typing.Tuple[int, int], n_actions: int, lr: float = 0.5, n_steps: int = 1,
-                 epsilon: float = 0.1, discount: float = 0.95, sarsa: bool = False, q_init: float = 0.0) -> None:
+                 epsilon: float = 0.1, discount: float = 0.95, sarsa: bool = False, optimal: bool = True,
+                 q_init: float = 0.0) -> None:
         super().__init__(observation_shape=observation_shape, n_actions=n_actions, lr=lr,
                          epsilon=epsilon, discount=discount, sarsa=sarsa, q_init=q_init)
+
+        self.optimal = optimal  # Whether to use Q* for TB-updates or a full Q expectation
+
         self.n_steps = n_steps  # Uses Tree-Backup(n) for sarsa = False, otherwise simply n-step SARSA.
+        self.transitions = list()
 
     def tree_backup(self, transitions: typing.List[TabularQLearningN.Transition], t_start: int) -> None:
         # Basic n-step Tree Backup
@@ -144,21 +149,33 @@ class TabularQLearningN(TabularQLearning):
             G = transition_T.reward
         else:
             pos_end = self._get_pos(transition_T.next_state)
-            a_end = self.sample(transition_T.next_state, behaviour_policy=self._sarsa)
-            G = transition_T.reward + self.discount * self._q_table[pos_end][a_end]
+
+            q_end = self._q_table[pos_end].max()
+            if not self.optimal:  # Reweigh Q using soft epsilon policy.
+                q_end = self.epsilon * (self._q_table[pos_end].mean()) + (1 - self.epsilon) * q_end
+
+            G = transition_T.reward + self.discount * q_end
 
         # Backup from leaf node, cut traces where a != a* if using Q-learning.
         for k in reversed(range(t_start, len(transitions) - 1)):
             # Awkward indexing due to r_t being stored under transition_t.
             s_k, a_k = transitions[k + 1].state, transitions[k + 1].action
 
-            if not self._sarsa:  # If off-policy (optimal Q^*) reset n-step trace at every non-greedy action.
+            if not self._sarsa:  # Use Tree-Backup Algorithm.
                 pos_k = self._get_pos(s_k)  # 1D 2-element arrays
-                a_greedy = self.sample(s_k, behaviour_policy=False)
 
                 # Reset trace if selected action isn't Q-optimal (don't reset in case of ties).
-                if not np.isclose(self._q_table[pos_k][a_greedy], self._q_table[pos_k][a_k]):
-                    G = self._q_table[pos_k][a_greedy]
+                q_max = self._q_table[pos_k].max()
+                greedy = np.isclose(q_max, self._q_table[pos_k][a_k])
+                if self.optimal:
+                    G = G if greedy else q_max
+                else:  # Reweigh Q using soft epsilon policy.
+                    mean = np.delete(self._q_table[pos_k], a_k).sum() / self.n_actions
+                    prob = (1 - self.epsilon) * int(greedy) + self.epsilon / self.n_actions
+
+                    G = self.epsilon * mean + prob * G
+                    if not greedy:  # Add remainder (1 - epsilon) mass with Q-max
+                        G += (1 - self.epsilon) * q_max
 
             # Generalizes n-step SARSA.
             G = transitions[k].reward + self.discount * G
@@ -182,7 +199,7 @@ class TabularQLearningN(TabularQLearning):
             state, goal_achieved, done = _env.reset(), False, False
 
             # n-step buffer
-            transitions = list()
+            self.transitions.clear()
 
             t = 0
             while not done:
@@ -194,8 +211,8 @@ class TabularQLearningN(TabularQLearning):
                 goal_achieved = meta['goal_achieved']
 
                 # Perform n-step Q-learning update.
-                transitions.append(TabularQLearningN.Transition(state, a, r, next_state, goal_achieved))
-                self.update(transitions, t, meta=meta)
+                self.transitions.append(TabularQLearningN.Transition(state, a, r, next_state, goal_achieved))
+                self.update(self.transitions, t, meta=meta)
 
                 # Update state of control
                 state = next_state
@@ -210,15 +227,15 @@ class TabularQLambda(TabularQLearningN):
 
     def __init__(self, observation_shape: typing.Tuple[int, int], n_actions: int, lr: float = 0.5, decay: float = 0.9,
                  n_steps: int = None, epsilon: float = 0.1, discount: float = 0.95, replace: bool = False,
-                 decay_lr: float = -0.5, sarsa: bool = False, q_init: float = 0.0) -> None:
+                 decay_lr: float = -0.5, sarsa: bool = False, optimal: bool = True, q_init: float = 0.0) -> None:
         super().__init__(observation_shape=observation_shape, n_actions=n_actions, lr=lr, n_steps=None,
-                         epsilon=epsilon, discount=discount, sarsa=sarsa, q_init=q_init)
+                         epsilon=epsilon, discount=discount, sarsa=sarsa, optimal=optimal, q_init=q_init)
         # Learning rate scheduling (Q-values may diverge if not used)
         self.decay_lr = decay_lr
         self._lr_base = lr
 
         self.decay = decay
-        self.replace = replace
+        self.replace = replace  # Whether to use replacing traces or accumulating traces.
         self.trace = np.zeros_like(self._q_table, dtype=np.float32)
 
         self.episodes = 0
@@ -240,13 +257,15 @@ class TabularQLambda(TabularQLearningN):
         # Update eligibility trace. SARSA(λ) for retain = 1, TB(λ) for retain = 0.
         retain = 1
         if not self._sarsa:  # TB(λ)
-            a_greedy = self.sample(transition.state, behaviour_policy=False)
+            q_max = self._q_table[pos_t].max()
+            greedy = np.isclose(q_max, self._q_table[pos_t][a_t])
 
-            # Reset trace if selected action isn't Q-optimal (don't reset in case of ties).
-            if not np.isclose(self._q_table[pos_t][a_greedy], self._q_table[pos_t][transition.action]):
-                retain = 0
+            # If Optimal: reset trace if action not Q-optimal (ignore ties).
+            retain = int(greedy)
+            if not self.optimal:  # Else: Expected sarsa --> retain = Pr(a | s)
+                retain = (1 - self.epsilon) * int(greedy) + self.epsilon / self.n_actions
 
-        # Replacing traces: Compute z_t = γλπ(a|s)z_(t-1) + ∇q(s, a, w), w are the 'weights' == Q-table averages.
+        # Replacing traces: Compute z_t = γλπ(a|s)z_(t-1) + ∇q(s, a, w), w are the 'weights' == Q-table values.
         self.trace = self.discount * self.decay * retain * self.trace
         if self.replace:  # Reset trace on revisits.
             self.trace[pos_t][...] = 0
@@ -271,6 +290,7 @@ class TabularQLambda(TabularQLearningN):
 
             # Initialize agent dependencies
             self.trace[...] = 0
+            self.transitions.clear()
             self.update_step_sizes()
 
             t = 0
@@ -283,7 +303,8 @@ class TabularQLambda(TabularQLearningN):
                 goal_achieved = meta['goal_achieved']
 
                 # Perform n-step Q-learning update.
-                self.update(TabularQLearningN.Transition(state, a, r, next_state, goal_achieved), meta=meta)
+                self.transitions.append(TabularQLearningN.Transition(state, a, r, next_state, goal_achieved))
+                self.update(self.transitions[-1], meta=meta)
 
                 # Update state of control
                 state = next_state
@@ -297,11 +318,11 @@ class TabularQET(TabularQLambda):
 
     def __init__(self, observation_shape: typing.Tuple[int, int], n_actions: int, lr: float = 0.5, decay: float = 0.9,
                  n_steps: int = None, epsilon: float = 0.1, discount: float = 0.95, replace: bool = False,
-                 decay_lr: float = -0.5, eta: float = 0.0, beta: float = 0.5, sarsa: bool = False,
+                 optimal: bool = True, decay_lr: float = -0.5, eta: float = 0.0, beta: float = 0.5, sarsa: bool = False,
                  q_init: float = 0.0) -> None:
         super().__init__(observation_shape=observation_shape, n_actions=n_actions, lr=lr, n_steps=None, decay=decay,
                          decay_lr=decay_lr, replace=replace, epsilon=epsilon, discount=discount, sarsa=sarsa,
-                         q_init=q_init)
+                         optimal=optimal, q_init=q_init)
         # Learning rate scheduling for trace model
         self._beta_base = beta
 
@@ -328,11 +349,13 @@ class TabularQET(TabularQLambda):
         # Update eligibility trace.
         retain = 1
         if not self._sarsa:  # TB(λ)
-            a_greedy = self.sample(transition.state, behaviour_policy=False)
+            q_max = self._q_table[pos_t].max()
+            greedy = np.isclose(q_max, self._q_table[pos_t][a_t])
 
-            # Reset trace if selected action isn't Q-optimal (don't reset in case of ties).
-            if not np.isclose(self._q_table[pos_t][a_greedy], self._q_table[pos_t][transition.action]):
-                retain = 0
+            # If Optimal: reset trace if action not Q-optimal (ignore ties).
+            retain = int(greedy)
+            if not self.optimal:  # Else: Expected sarsa --> retain = Pr(a | s)
+                retain = (1 - self.epsilon) * int(greedy) + self.epsilon / self.n_actions
 
         # Replacing traces: Compute z_t = γλπ(a|s)z_(t-1) + ∇q(s, a, w), w are the 'weights' == Q-table averages.
         self.trace = self.discount * self.decay * retain * self.trace
@@ -342,7 +365,7 @@ class TabularQET(TabularQLambda):
         else:  # Accumulate trace
             self.trace[pos_t][a_t] += 1
 
-        # Compute the Bellman error
+        # Compute the TD error
         delta = transition.reward + self.discount * self._q_table[pos_next][a_t_next] - self._q_table[pos_t][a_t]
 
         # Update the Expected Eligibility trace Model.
