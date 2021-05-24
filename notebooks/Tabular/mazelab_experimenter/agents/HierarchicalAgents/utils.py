@@ -57,15 +57,38 @@ class HierarchicalTrace:
 
 @dataclass
 class HierarchicalEligibilityTrace:
+
+    @dataclass
+    class TraceEntry:
+        state: int
+        action: int
+        time: int
+        previous: HierarchicalEligibilityTrace.TraceEntry = None
+
     horizon: int
-    dimensions: typing.Tuple
-    trace: typing.List[np.ndarray] = None  # Time trace of dim (horizon, states, goals, actions)
+    num_goals: int
+    trace: typing.List[typing.List] = None
+    cuts: typing.List[np.ndarray] = None   # Time-index for each goal to track where traces are cut.
+    TRUNCATE: float = 1e-8  # Trace truncation value for very small floats
+
+    def add(self, h: int, s: int, a: int, t: int) -> None:
+        entry = self.TraceEntry(state=s, action=a, time=t)
+        if len(self.trace[h]):
+            entry.previous = self.trace[h][-1]
+        self.trace[h].append(entry)
+
+    def cut(self, h: int, indices: np.ndarray, t: int) -> None:
+        self.cuts[h][indices] = t
 
     def reset(self) -> None:
+        """ Clear/ initialize all trace variables. """
         if self.trace is None:
-            self.trace = [np.zeros(self.dimensions, dtype=np.float32) for _ in range(self.horizon)]
-        for e in self.trace:
-            e[...] = 0
+            self.trace = [list() for _ in range(self.horizon)]
+            self.cuts = [np.zeros(self.num_goals, dtype=np.int32) for _ in range(self.horizon)]
+
+        for i in range(self.horizon):
+            self.trace[i].clear()
+            self.cuts[i][...] = 0
 
 
 @dataclass

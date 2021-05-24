@@ -178,7 +178,7 @@ def evaluate(_env: gym.Env, _agent: Agent, _num_evals: int, agent_kwargs: typing
                 h.clear()
             
         outer_data = dict(  # Yield all outer loop statistics for logging.
-            agent=_agent, cumulative=g, time=step, success=goal_achieved
+            agent=_agent, cumulative=g, t=step, success=goal_achieved
         )
         _ = [h.collect(**outer_data) for h in outer_loop_hooks]
         
@@ -196,7 +196,7 @@ def evaluate(_env: gym.Env, _agent: Agent, _num_evals: int, agent_kwargs: typing
 
 
 def benchmark(env_id: typing.Union[str, gym.Env], _agent_gen: typing.Callable,
-              agent_test_kwargs: typing.Dict, agent_train_kwargs: typing.Dict,
+              agent_test_kwargs: typing.Dict, agent_train_kwargs: typing.Dict, skip_random_evaluation: bool,
               num_repetitions: int, num_iterations: int, num_episodes: int, num_trials: int,
               evaluation_hooks: typing.List[Hook], verbose: bool = True, **kwargs) -> typing.List:
     """Full functionality for benchmarking a single reinforcement learning.
@@ -211,6 +211,7 @@ def benchmark(env_id: typing.Union[str, gym.Env], _agent_gen: typing.Callable,
     :param _agent_gen: typing.Callable A function that yields an Agent object to be trained and evaluated (benchmarked).
     :param agent_test_kwargs: dict Keyword arguments for the agent's action selection during evaluation.
     :param agent_train_kwargs: dict Keyword arguments specific for the agent's training loop.
+    :param skip_random_evaluation: bool Whether to evaluate the agent before training (usually a random policy).
     :param num_repetitions: int Number of times to repeat the train-test procedure.
     :param num_iterations: int Number of times to train-test the agent.
     :param num_episodes: int Number of times to train the agent for each train-test iteration.
@@ -230,7 +231,7 @@ def benchmark(env_id: typing.Union[str, gym.Env], _agent_gen: typing.Callable,
     repetition_data = list()
     for r in range(num_repetitions):
         # Ensure we have a freshly initialized agent.
-        agent.cut()
+        agent.reset()
 
         if verbose:
             # If specified log time statistics to the console.
@@ -241,14 +242,16 @@ def benchmark(env_id: typing.Union[str, gym.Env], _agent_gen: typing.Callable,
                   f"--- Rate: {int(rate)} sec/ it --- Total: {total / 60:.2f} min")
 
         # Test the freshly initialized agent (without parameter updates) and store results.
-        data = [
-            evaluate(
-                _env=env, _agent=agent, _num_evals=num_trials,
-                agent_kwargs=agent_test_kwargs,
-                outer_loop_hooks=evaluation_hooks,
-                clear_outer_hook=True,
-                progress_bar=False)[0]
-        ]
+        data = list()
+        if not skip_random_evaluation:
+            data.append(
+                evaluate(
+                    _env=env, _agent=agent, _num_evals=num_trials,
+                    agent_kwargs=agent_test_kwargs,
+                    outer_loop_hooks=evaluation_hooks,
+                    clear_outer_hook=True,
+                    progress_bar=False)[0]
+            )
 
         for _ in (tqdm.trange(num_iterations, file=sys.stdout, desc="Train-Test loop") if verbose else range(num_iterations)):
             # Train the agent for a number of times

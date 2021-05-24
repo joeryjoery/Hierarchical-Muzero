@@ -16,7 +16,7 @@ class AgentShelve:
         'RandomAgent': agents.RandomAgent,
         'HierQ': agents.HierQ,
         'HierQV2': agents.HierQV2,
-        'HierQTB': agents.HierQN,
+        'HierQN': agents.HierQN,
         'HierQTD': agents.HierQTD,
         'HierQTS': agents.HierQTS,
         'HierQLambda': agents.HierQLambda

@@ -1,5 +1,4 @@
 from .interface import Agent
-from .agents import MonteCarloQLearner, TabularQLearning, TabularDynaQ, RandomAgent, TabularQLearningN, \
+from .baseline import MonteCarloQLearner, TabularQLearning, TabularDynaQ, RandomAgent, TabularQLearningN, \
     TabularQLambda, TabularQET
-from .HierQ import HierQ
-from .HierarchicalAgents import HierQV2, HierQTD, HierQTS, HierQLambda, HierQN
+from .HierarchicalAgents import HierQ, HierQV2, HierQN, HierQLambda, HierQTD, HierQTS
