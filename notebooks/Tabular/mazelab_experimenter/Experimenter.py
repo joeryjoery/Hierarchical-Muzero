@@ -47,7 +47,7 @@ class PredictionErrorHook(Hook):
         super().__init__()
         self._reference = reference
         self._get_critic = get_critic
-        self._values = None
+        self._value = None
         self._f_aggr = f_aggr
 
     def labels(self) -> typing.List:
@@ -56,14 +56,15 @@ class PredictionErrorHook(Hook):
 
     def clear(self) -> None:
         """ Clear internal state variables. """
-        self._values = None
+        self._value = None
 
     def collect(self, agent: Agent, **kwargs) -> None:
         """ Log whether the agent reached a goal state, its cumulative episode reward, and the episode length. """
-        self._values = self._get_critic(agent) - self._reference
+        if self._value is None:
+            self._value = self._f_aggr(self._get_critic(agent) - self._reference)
 
     def aggregate(self, **kwargs) -> typing.Generic:
-        return self._f_aggr(self._values)
+        return self._value
 
 
 class GenericOuterHook(Hook):
@@ -72,7 +73,7 @@ class GenericOuterHook(Hook):
     _LABELS = ["Success Statistic", "Cumulative Reward", "Episode Length"]
     
     def __init__(self, f_aggr: typing.Callable = np.mean) -> None:
-        """Initialize the monitorring hook with an aggregation function. Defaults to a sample average.
+        """Initialize the monitoring hook with an aggregation function. Defaults to a sample average.
         
         :param f_aggr: typing.Callable Aggregation function for summarizing collected statistics.
         """

@@ -39,9 +39,9 @@ class HierarchicalTrace:
         """ Access the non-degenerate transitions of the trace. """
         return self.transitions[t]
 
-    def window(self, level: int) -> int:
+    def window(self, level: int, raw: bool = False) -> int:
         """Get the size of the currently open window of trailing states for the given hierarchy level."""
-        return min([self.horizons[level], len(self)])
+        return min([self.horizons[level], (len(self) if (not raw) else len(self.raw))])
 
     def add(self, transition: GoalTransition) -> None:
         """ Add a state-action transition to the trace, the transition is hidden if state == next_state. """
@@ -69,7 +69,7 @@ class HierarchicalEligibilityTrace:
     num_goals: int
     trace: typing.List[typing.List] = None
     cuts: typing.List[np.ndarray] = None   # Time-index for each goal to track where traces are cut.
-    TRUNCATE: float = 1e-8  # Trace truncation value for very small floats
+    TRUNCATE: float = 1e-8  # Trace truncation value for extremely small floats (as good as zero)
 
     def add(self, h: int, s: int, a: int, t: int) -> None:
         entry = self.TraceEntry(state=s, action=a, time=t)

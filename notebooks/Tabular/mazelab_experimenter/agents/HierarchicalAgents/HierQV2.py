@@ -7,6 +7,7 @@ Note that the discount parameter should be in (0, 1) for the binary reward funct
 
 """
 from __future__ import annotations
+import functools
 import typing
 import sys
 from abc import ABC
@@ -27,12 +28,14 @@ from mazelab_experimenter.utils import ravel_moore_index, ravel_neumann_index, u
 
 class TabularHierarchicalAgentV2(TabularHierarchicalAgent, ABC):
     _ILLEGAL: int = -1
+    _GOAL_PADDING: int = 1
 
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
-                 horizons: typing.Union[typing.List[int]], lr: float = 0.5, epsilon: float = 0.1,
-                 discount: float = 0.95, relative_actions: bool = False, relative_goals: bool = False,
-                 universal_top: bool = False, shortest_path_rewards: bool = False,
-                 legal_states: np.ndarray = None, **kwargs) -> None:
+                 horizons: typing.Union[typing.List[int]], discount: float = 0.95,
+                 lr: float = 0.5, epsilon: float = 0.1, lr_decay: float = 0.0,
+                 relative_actions: bool = False, relative_goals: bool = False, universal_top: bool = False,
+                 shortest_path_rewards: bool = False, sarsa: bool = False, stationary_filtering: bool = True,
+                 hindsight_goals: bool = True, legal_states: np.ndarray = None, **kwargs) -> None:
         super().__init__(observation_shape=observation_shape, n_actions=n_actions, n_levels=n_levels, **kwargs)
 
         assert type(horizons) == int or (type(horizons) == list and len(horizons) == n_levels), \
@@ -40,9 +43,13 @@ class TabularHierarchicalAgentV2(TabularHierarchicalAgent, ABC):
             f"this should either be a fixed integer or a list in ascending hierarchy order."
 
         # Learning parameters
-        self.lr = lr
-        self.epsilon = epsilon
+        self.lr_base = self.lr = lr
+        self.lr_decay = lr_decay
         self.discount = discount
+        self.sarsa = sarsa
+        # Only atomic exploration by default for a given epsilon.
+        self.epsilon = np.asarray([epsilon] + [0.] * (n_levels - 1), dtype=np.float32) \
+            if type(epsilon) == float else np.asarray(epsilon, dtype=np.float32)
         self.horizons = np.full(n_levels, horizons, dtype=np.int32) \
             if type(horizons) == int else np.asarray(horizons, dtype=np.int32)
         self.atomic_horizons = [int(np.prod(self.horizons[:i])) for i in range(0, self.n_levels + 1)]
@@ -51,7 +58,12 @@ class TabularHierarchicalAgentV2(TabularHierarchicalAgent, ABC):
         self.relative_actions = relative_actions
         self.relative_goals = relative_goals
         self.universal_top = universal_top
+        self.hindsight_goals = hindsight_goals
         self.shortest_path_rewards = shortest_path_rewards
+        self.stationary_filtering = stationary_filtering
+
+        # Number of training episodes done.
+        self.episodes = 0
 
         # Initialize the agent's state space, goal space and action space.
         self.S, self.S_legal = np.arange(np.prod(observation_shape)), legal_states
@@ -70,13 +82,26 @@ class TabularHierarchicalAgentV2(TabularHierarchicalAgent, ABC):
             if np.sum(np.asarray(self.atomic_horizons[1:-1]) == max(self.observation_shape) // 2 - 1) > 1:
                 print("Warning: multiple action spaces exceed the environment' size, perhaps use absolute goals?")
 
-        if relative_goals:  # Bound the goal space for each policy level proportional to its horizon + a small constant.
-            c_r = self.horizons[0]  # Goal-radius correction term.
-            self.G[:-1], self.G_xy[:-1] = self._to_neighborhood(radii=[(r + c_r) for r in self.atomic_horizons[1:-1]])
-            raise NotImplementedError("TODO")
-
         if not self.universal_top:  # Do not condition top-level policy/ table on goals (more memory efficient).
             self.G[-1] = [0]
+
+        if relative_goals or (not hindsight_goals):  # Bound the goal space for each policy level through masking
+            self.G_radii = [((r + self._GOAL_PADDING) if hindsight_goals else 0) for r in self.atomic_horizons[1:-1]]
+            _, goal_states = self._to_neighborhood(radii=self.G_radii, mask_center=False)
+
+            self.goal_mask = list()
+            for i in range(len(goal_states)):
+                masks = list()
+                for states in goal_states[i]:
+                    mask = np.ones_like(self.G[i], dtype=np.bool)
+                    pool = states[np.flatnonzero(states >= 0)]
+                    mask[pool] = False
+
+                    masks.append(mask)
+
+                self.goal_mask.append(masks)
+
+            self.goal_mask.append([np.zeros_like(self.G[-1])] * len(self.G[-1]))
 
         # Given all adjusted dimensions, initialize Q tables.
         self.critics = list()
@@ -90,7 +115,13 @@ class TabularHierarchicalAgentV2(TabularHierarchicalAgent, ABC):
 
             self.critics.append(critic)
 
-    def _to_neighborhood(self, radii: typing.List) -> typing.Tuple[typing.List, typing.List]:
+    def reward_func(self, r_mask: np.ndarray, bootstrap: np.ndarray) -> np.ndarray:
+        if self.shortest_path_rewards:
+            return (1 - r_mask) * (-1 + self.discount * bootstrap)
+        else:
+            return r_mask + (1 - r_mask) * self.discount * bootstrap
+
+    def _to_neighborhood(self, radii: typing.List, mask_center: bool = True) -> typing.Tuple[typing.List, typing.List]:
         """ Correct the current absolute action space parameterization to a relative/ bounded action space. """
         relative_indices = [np.arange(
             neumann_neighborhood_size(r) if self.motion == Agent._NEUMANN_MOTION else moore_neighborhood_size(r)
@@ -110,7 +141,8 @@ class TabularHierarchicalAgentV2(TabularHierarchicalAgent, ABC):
 
                 # Mask out out of bound actions.
                 mask = np.all((0, 0) <= coords, axis=-1) & np.all(coords < self.observation_shape, axis=-1)
-                mask[len(coords) // 2] = 0  # Do nothing action.
+                if mask_center:
+                    mask[len(coords) // 2] = 0  # Do nothing action.
 
                 states = TabularHierarchicalAgentV2._ILLEGAL * np.ones(len(coords))
                 states[mask] = self._get_index(coords[mask].T)
@@ -127,6 +159,8 @@ class TabularHierarchicalAgentV2(TabularHierarchicalAgent, ABC):
 
     def reset(self, full_reset: bool = False) -> None:
         self.clear_hierarchy(self.n_levels - 1 - int(not full_reset))
+        self.lr = self.lr_base
+        self.episodes = 0
         for critic in self.critics:
             critic.reset()
 
@@ -158,17 +192,31 @@ class TabularHierarchicalAgentV2(TabularHierarchicalAgent, ABC):
 
 class HierQV2(TabularHierarchicalAgentV2):
 
+    def policy_hook(function: typing.Callable) -> typing.Callable:
+        """ Defines a decorator that enables the agent to follow a fixed action-trace on an atomic level. """
+        @functools.wraps(function)
+        def _policy_hook(self, level: int, *args, **kwargs):
+            if self._path and (not level):
+                return self._path.pop()  # Return atomic action currently on top of the stack.
+            return function(self, level=level, *args, **kwargs)
+        return _policy_hook
+
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
-                 horizons: typing.Union[typing.List[int]], lr: float = 0.5, epsilon: float = 0.1,
-                 discount: float = 0.95, relative_actions: bool = False, relative_goals: bool = False,
-                 universal_top: bool = False, shortest_path_rewards: bool = False,
-                 legal_states: np.ndarray = None, **kwargs) -> None:
+                 horizons: typing.Union[typing.List[int]], discount: float = 0.95,
+                 lr: float = 0.5, epsilon: float = 0.1, lr_decay: float = 0.0,
+                 relative_actions: bool = False, relative_goals: bool = False, universal_top: bool = False,
+                 shortest_path_rewards: bool = False, sarsa: bool = False, stationary_filtering: bool = True,
+                 hindsight_goals: bool = True, legal_states: np.ndarray = None, **kwargs) -> None:
         super().__init__(
-            observation_shape=observation_shape, n_actions=n_actions, n_levels=n_levels,
-            horizons=horizons, lr=lr, epsilon=epsilon, discount=discount,
+            observation_shape=observation_shape, n_actions=n_actions, n_levels=n_levels, horizons=horizons,
+            discount=discount, lr=lr, epsilon=epsilon, lr_decay=lr_decay,
             relative_actions=relative_actions, relative_goals=relative_goals, universal_top=universal_top,
-            shortest_path_rewards=shortest_path_rewards, legal_states=legal_states, **kwargs
+            hindsight_goals=hindsight_goals, stationary_filtering=stationary_filtering,
+            shortest_path_rewards=shortest_path_rewards, sarsa=sarsa, legal_states=legal_states, **kwargs
         )
+        # Environment path to take overriding the agent policy (useful for debugging or visualization)
+        self._path: typing.List[int] = None
+
         # Data structures for keeping track of an environment trace along with a deque that retains previous
         # states within the hierarchical policies' action horizon. Last atomic_horizon value should be large.
         self.trace = HierarchicalTrace(num_levels=self.n_levels, horizons=self.atomic_horizons)
@@ -186,6 +234,12 @@ class HierQV2(TabularHierarchicalAgentV2):
         """ Check whether the given arrays 'a' and 'b' are contained within the radius dependent on the motion. """
         return (manhattan_distance(a, b) if motion == Agent._NEUMANN_MOTION else chebyshev_distance(a, b)) < r
 
+    def _fix_policy(self, path: typing.List[int]) -> None:
+        """ Fix the policy of the agent to strictly follow a given path *once*.
+        Path should be ordered chronologically which is reversed in the form of an action-stack.
+        """
+        self._path = path[::-1].copy()
+
     def convert_action(self, level: int, reference: int, displaced: int, to_absolute: bool = False) -> int:
         if to_absolute:
             return self.A_xy[level][reference][displaced]
@@ -198,19 +252,20 @@ class HierQV2(TabularHierarchicalAgentV2):
             return True
         return self.inside_radius(self.S_xy[state], self.S_xy[goal], r=self.atomic_horizons[level], motion=self.motion)
 
+    @policy_hook
     def get_level_action(self, s: int, g: int, level: int, explore: bool = True) -> int:
         """Sample a **Hierarchy action** (not an Environment action) from the Agent. """
         # Helper variables
         gc = g * int(self.critics[level].goal_conditioned)  # TODO: g to relative index
 
         if (not level) and explore:  # Epsilon greedy
-            if self.epsilon > np.random.rand():
+            if self.epsilon[0] > np.random.rand():
                 return np.random.randint(self.n_actions)
 
             optimal = np.flatnonzero(self.critics[level].table[s, gc] == self.critics[level].table[s, gc].max())
             return np.random.choice(optimal)
 
-        greedy = int(level or (not explore) or (np.random.rand() > self.epsilon))
+        greedy = int((not explore) or (np.random.rand() > self.epsilon[level]))
 
         pref = g if level else None          # Goal-selection bias for shared max Q-values.
         if level and self.relative_actions:  # Action Preference: Absolute-to-Neighborhood for policy Action-Space
@@ -236,40 +291,52 @@ class HierQV2(TabularHierarchicalAgentV2):
 
         return action
 
-    def update_critics(self) -> None:
-        # At each level, update Q-tables for each trailing state for all possible subgoals.
-        s_target = self.trace.raw[-1].next_state
-        self.update_table(0, self.trace.raw[-1].state, self.trace.raw[-1].action, s_target)
-        for i in range(1, self.n_levels):
-            for h in reversed(range(self.trace.window(i))):
-                self.update_table(i, self.trace[-(h + 1)].state, s_target, s_target, end_pos=self.trace[-1].goal)
+    def update_tables(self) -> None:
+        # Always update atomic policy under the raw trace, update higher level policies only on actual transitions.
+        self.update_table(level=0, horizon=1, trace=self.trace.raw)
 
-    def update_table(self, level: int, s: int, a: int, s_next: int, end_pos: int = None) -> None:
+        # Higher levels are either always updated or updates on actual environment transitions.
+        raw = self.trace.raw[-1].degenerate
+        if (not raw) or (not self.stationary_filtering):
+            trace = self.trace.raw if raw else self.trace.transitions
+
+            # Update Q tables at each level using built trace.
+            for i in range(1, self.n_levels):
+                self.update_table(level=i, horizon=self.trace.window(i, raw=raw), trace=trace)
+
+    def update_table(self, level: int, horizon: int, trace: typing.Sequence[GoalTransition], **kwargs) -> None:
         """Update Q-Tables with given transition """
-        if level and self.relative_actions:  # Convert goal-action 'a' from Absolute-to-Neighborhood.
-            a = self.convert_action(level, reference=s, displaced=s_next)
+        s_next, end_pos = trace[-1].next_state, trace[-1].goal[0]
+        for h in reversed(range(horizon)):
+            s = trace[-(h + 1)].state
+            a = s_next if level else trace[-1].action
 
-        # Hindsight action transition mask.
-        if self.relative_goals:
-            delta = np.asarray((self.S_xy[s], self.S_xy[s_next])).T
-            g_her = self.ravel_delta_indices(np.diff(delta).T, r=self.atomic_horizons[level], motion=self.motion).item()
+            if level and self.relative_actions:  # Convert goal-action 'a' from Absolute-to-Neighborhood.
+                a = self.convert_action(level, reference=s, displaced=s_next)
 
-            goals = self.G[level]  # TODO: adjust goal-index for each trailing state.
-            mask = np.zeros_like(goals)
-            if self.critics[level].goal_conditioned:
-                mask[g_her] = 1
-            else:  # Non-universal top level
-                mask[0] = (end_pos == s_next)
-        else:
-            goals, mask = (self.G[level], self.G[level] == s_next) \
-                if self.critics[level].goal_conditioned else (0, end_pos == s_next)
+            # Hindsight action transition mask.
+            if self.critics[level].goal_conditioned and (not self.hindsight_goals):
+                # Single-Update: Only update goal-table for the current state-goal.
+                goals, mask = (s_next, 1)
+            else:
+                # Multi-Update: Update all possible goals simultaneously for goal-conditioned tables.
+                goals, mask = (self.G[level], self.G[level] == s_next) \
+                    if self.critics[level].goal_conditioned else (self.G[level], end_pos == s_next)
 
-        # Q-Learning update for each goal-state.
-        if self.shortest_path_rewards:
-            ys = (1 - mask) * (-1 + self.discount * np.amax(self.critics[level].table[s_next, goals], axis=-1))
-        else:
-            ys = mask + (1 - mask) * self.discount * np.amax(self.critics[level].table[s_next, goals], axis=-1)
-        self.critics[level].table[s, goals, a] += self.lr * (ys - self.critics[level].table[s, goals, a])
+            # Q-Learning update for each goal-state.
+            bootstrap = np.amax(self.critics[level].table[s_next, goals], axis=-1)
+            if self.sarsa:  # Expected SARSA target.
+                p = self.epsilon[level]
+                bootstrap = p * self.critics[level].table[s_next, goals].mean(axis=-1) + (1 - p) * bootstrap
+
+            ys = self.reward_func(mask, bootstrap)
+            delta = ys - self.critics[level].table[s, goals, a]
+            if self.relative_goals or (not self.hindsight_goals):
+                if self.critics[level].goal_conditioned:
+                    # Bounded goals: Only update goal-table for the in-range goals
+                    delta[self.goal_mask[level][s]] = 0
+
+            self.critics[level].table[s, goals, a] += self.lr * delta
 
     def update(self, _env: gym.Env, level: int, state: int, goal_stack: typing.List[int]) -> typing.Tuple[int, bool]:
         """Train level function of Algorithm 2 HierQ by (Levy et al., 2019).
@@ -287,10 +354,14 @@ class HierQV2(TabularHierarchicalAgentV2):
 
                 # Keep a memory of observed states to update Q-tables with hindsight.
                 self.trace.add(GoalTransition(
-                    state=state, goal=goal_stack[0], action=a, next_state=s_next, terminal=terminal, reward=None))
+                    state=state, goal=tuple(goal_stack), action=a, next_state=s_next, terminal=terminal, reward=r))
 
-                # Update critic/ Q-tables given the current (global) trace of experience.
-                self.update_critics()
+                # Update Q-tables given the current (global) trace of experience.
+                # Always update the i = 0 table and either always update i > 0 tables or only on state-transitions.
+                raw = self.trace.raw[-1].degenerate  # : s == s_next
+                for i in range((self.n_levels if (not raw) or (not self.stationary_filtering) else 1)):
+                    trace = self.trace.raw if ((i == 0) or raw) else self.trace.transitions
+                    self.update_table(level=i, horizon=self.trace.window(i, raw=raw), trace=trace)
 
             # Update state of control. Terminate level if new state is out of reach of current goal.
             state = s_next
@@ -298,9 +369,13 @@ class HierQV2(TabularHierarchicalAgentV2):
 
         return state, done
 
-    def clear_training_variables(self) -> None:
+    def update_training_variables(self) -> None:
         # Clear all trailing states in each policy's deque.
         self.trace.reset()
+        if 0.0 < self.lr_decay <= 1.0 and self.episodes:  # Decay according to lr_base * 1/(num_episodes ^ decay)
+            self.lr = self.lr_base / (self.episodes ** self.lr_decay)
+        # : add epsilon-decay?
+        self.episodes += 1
 
     def train(self, _env: gym.Env, num_episodes: int, progress_bar: bool = False, **kwargs) -> None:
         """Train the HierQ agent through recursion with the `self.update` function.
@@ -316,7 +391,7 @@ class HierQV2(TabularHierarchicalAgentV2):
             goal_stack = [self._get_index(_env.unwrapped.maze.get_end_pos()[0])]
 
             # Reset memory of training episode.
-            self.clear_training_variables()
+            self.update_training_variables()
 
             done = False
             while (not done) and (state != goal_stack[0]):

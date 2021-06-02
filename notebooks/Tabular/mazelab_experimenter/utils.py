@@ -5,9 +5,11 @@ General utility functions.
   https://stackoverflow.com/questions/7632963/numpy-find-first-index-of-value-fast
 """
 import typing
+from mazelab.solvers import dijkstra_solver
 from enum import Enum
 
 import numpy as np
+import gym
 
 
 class MazeObjects(Enum):
@@ -16,6 +18,21 @@ class MazeObjects(Enum):
     OBSTACLE = 1
     GOAL = 2
     AGENT = 3
+
+
+def compute_optimal_value(_env: gym.Env) -> np.ndarray:
+    world = _env.unwrapped.maze.arr.astype(bool)  # 1 = wall, 0 = empty
+    m = _env.unwrapped.motions
+    g = _env.unwrapped.maze.get_end_pos()[0]
+
+    coords = np.indices(world.shape).reshape(2, -1).T
+
+    solution = np.zeros(len(coords))
+    states = np.flatnonzero(~world.ravel())
+    for s in states:
+        solution[s] = len(dijkstra_solver(impassable_array=world, motions=m, start_idx=coords[s], goal_idx=g))
+
+    return solution
 
 
 def get_pos(maze: np.ndarray) -> typing.Tuple:

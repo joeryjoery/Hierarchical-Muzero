@@ -123,7 +123,7 @@ def run_HAC(state_mat,agent,env,FLAGS):
 
             # Update critic lookup table
             if not FLAGS.test:
-                agent.update_critic(old_state,action,reward,state,goal,done)
+                agent.update_table(old_state, action, reward, state, goal, done)
                 # print("New Q(s,a) v3: ", agent.critic[old_state][action])
 
             t += 1

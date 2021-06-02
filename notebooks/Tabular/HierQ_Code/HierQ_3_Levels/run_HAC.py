@@ -119,10 +119,10 @@ def run_HAC(state_mat, agent, env, FLAGS, time_limits):
 
                     # Update critic lookup tables
                     if not FLAGS.test:
-                        agent.update_critic(0, old_state, action, state, gs)
+                        agent.update_table(0, old_state, action, state, gs)
                         for i in range(1, 3):
                             for s_mem in trailing_states[i - 1]:
-                                agent.update_critic(i, s_mem, state, state, gs)
+                                agent.update_table(i, s_mem, state, state, gs)
                     if layer_0_achieved or layer_1_achieved or solve:
                         break
                 if layer_1_achieved or solve:
